@@ -3,23 +3,13 @@ import SwiftUI
 /// Centralized tokens for layout, spacing, radius, and shadow.
 enum Palette {
     // Window
-    //
-    // minWidth — must be at least the HUD's natural width plus 20pt of
-    // breathing room (10pt on each side). The HUD holds 7 controls;
-    // their combined natural width is roughly 480pt, so 500 is the
-    // safe floor.
+    // minWidth 500 = HUD 7 个控件 (~480pt) + 各 10pt 留白。
     static let minWindowWidth: CGFloat = 500
-    //
-    // minHeight — must fit at least one line of the committed caption
-    // (the formal subtitle). HUD overlay and draft slot auto-hide when
-    // the window is at this floor; taller windows bring them back.
-    // 68pt is enough for one line of translated text without clipping.
+    // minHeight 68 = 1 行 committed 字幕 + 一行高度。
+    //   HUD 和 draft 在此高度自动隐藏,窗口拉高时回来。
     static let minWindowHeight: CGFloat = 68
-    //
-    // defaultHeight — height the panel opens at. Larger than the
-    // floor so the HUD (~70pt) plus a line of committed caption
-    // (~30pt) both fit comfortably. The user can still drag down to
-    // `minWindowHeight`.
+    // defaultHeight 100 = HUD (~70pt) + 一行 committed (~30pt)。
+    //   用户仍能拖到 minWindowHeight。
     static let defaultWindowHeight: CGFloat = 100
 
     // Backwards-compat aliases used in a few spots.
@@ -40,7 +30,12 @@ enum Palette {
     static let controlHeight: CGFloat = 22
 
     // Stage
-    static let historyMinVisible: CGFloat = 185
+    // 显示三层(history + committed + draft)的最小 contentH。
+    //   160pt → 窗体 ≥ 230pt 显示 history。
+    static let historyMinVisible: CGFloat = 160
+    // 显示 draft 的最小 contentH(独立于 minWindowHeight)。
+    //   90pt → 默认窗体 100pt 不显示 draft;拖到窗体 ≥ 160pt 才出现。
+    static let draftMinVisible: CGFloat = 90
     static let sourceMinVisible: CGFloat = 62
     static let historyMaxHeight: CGFloat = 1200
 

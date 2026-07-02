@@ -108,23 +108,14 @@ struct SubtitleStageView: View, Equatable {
 
     @ViewBuilder
     private func subtitleStage(availableH: CGFloat) -> some View {
-        // At the minimum window height we only show the committed
-        // (final) caption — draft and history regions are suppressed
-        // so the floor height remains a true floor for the formal
-        // line. `historyMinVisible` (185pt) already gates history;
-        // this additionally hides the draft slot when the window is
-        // pinned at the minimum. Between the floor and the full
-        // draft height we let the committed caption eat whatever it
-        // needs and give the draft whatever is left (it'll just
-        // clip if there's no room).
-        //
-        // `contentH` is the height available to subtitles after the
-        // HUD plate has been carved out.
+        // contentH = availableH - hudHeight。hideDraft 决策:
+        //   < draftMinVisible → 隐藏 draft(避免刚露 1/4 行的"半截"状态)
+        //   ≥ draftMinVisible → 显示 draft + committed,各自 fit-content
+        //     (DraftSubtitle 内 lineLimit 截断,SwiftUI VStack 自然堆叠)
+        // 之前用 committedHeight upper-bound (~236pt) 减 contentH 算
+        // draftHeight,导致 contentH < 236 时 draft 永远不显示 — 已改。
         let contentH = max(0, availableH - hudHeight)
-        let hideDraft = contentH < Palette.minWindowHeight
-        let draftHeight: CGFloat = hideDraft
-            ? 0
-            : max(0, contentH - committedHeight)
+        let hideDraft = contentH < Palette.draftMinVisible
         VStack(spacing: 0) {
             // 没正式字幕时显示占位字幕——作为"参考信息"卡让用户看到
             // 当前外观设置 (字体/字号/颜色/阴影) 的实时效果。
@@ -149,7 +140,7 @@ struct SubtitleStageView: View, Equatable {
                     .frame(maxWidth: .infinity, alignment: .top)
                     .id(cap.id)
             }
-            if draftHeight > 0 {
+            if !hideDraft {
                 // 不给 draft 固定/最大 frame——让 DraftSubtitle 自己按内容
                 // 算 fit-content 大小（BilingualStack + lineLimit(2/3) 自然
                 // 截断，不会撑爆窗口）。之前两种尝试都有问题：
@@ -164,22 +155,6 @@ struct SubtitleStageView: View, Equatable {
             }
         }
         .frame(maxWidth: .infinity, alignment: .top)
-    }
-
-    /// Upper-bound height the committed caption might consume, based on
-    /// the largest possible line layout (4 lines of translation + 3
-    /// lines of source). Used only to carve out space for the draft
-    /// slot — the caption itself isn't clamped.
-    private var committedHeight: CGFloat {
-        let transLineH = transFontSize * 1.18 + 2
-        let srcLineH = srcFontSize * 0.92 + 8
-        let lines = (showSource ? srcLineH * 3 : 0) + transLineH * 4
-        return lines + 4
-    }
-
-    private var draftSlotHeight: CGFloat {
-        let srcLineH = srcFontSize * 0.92 + 8
-        return srcLineH * 2 + 6
     }
 
     @ViewBuilder
