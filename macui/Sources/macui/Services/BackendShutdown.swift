@@ -81,6 +81,30 @@ enum BackendShutdown {
         Thread.sleep(forTimeInterval: 0.5)
 
         // 2. 启动新进程
+        // stdout+stderr 写到 translate-stream.log (truncate 模式 — 每次
+        // 重启会清空旧 log,这是用户主动行为,期望干净)
+        // C6 fix 同款哲学:stdout / stderr 用独立 FileHandle(独立 fd)。
+        // Python 进程如果某天引入多线程或异步写,共用 fd 会让 stderr 行
+        // 被 stdout 缓冲从中间切开 — 日志可读性灾难。translate_stream.py
+        // 现在是单线程顺序写,但兜底用独立 handle 更稳。
+        // FileHandle 必须活到 Process.run() 之后 — Process 持有 fd 引用,
+        // 直到 Process deinit 才释放 fd。
+        let stdoutPath = "/tmp/translate-stream.log"
+        let stderrPath = "/tmp/translate-stream.err.log"
+        // truncate 旧 logs
+        for path in [stdoutPath, stderrPath] {
+            do {
+                _ = try? Data().write(to: URL(fileURLWithPath: path))
+            }
+        }
+        guard let stdoutHandle = FileHandle(forWritingAtPath: stdoutPath),
+              let stderrHandle = FileHandle(forWritingAtPath: stderrPath) else {
+            fputs("[BackendShutdown] FAILED to open \(stdoutPath) / \(stderrPath) for log\n", stderr)
+            return false
+        }
+        stdoutHandle.seekToEndOfFile()
+        stderrHandle.seekToEndOfFile()
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: AppPaths.pythonExecutable)
         // --events 路径必须跟 BackendLauncher 启动 whicc.py 时用的
@@ -102,15 +126,17 @@ enum BackendShutdown {
             "--mode", "partial",
             "--target-lang", "auto",
         ]
-        // stdout+stderr 写到 translate-stream.log (truncate 模式 — 每次
-        // 重启会清空旧 log,这是用户主动行为,期望干净)
-        let logFile = FileHandle(forWritingAtPath: "/tmp/translate-stream.log")
-        task.standardOutput = logFile ?? FileHandle.nullDevice
-        task.standardError = logFile ?? FileHandle.nullDevice
+        task.standardOutput = stdoutHandle
+        task.standardError = stderrHandle
         do {
             try task.run()
+            // stdoutHandle / stderrHandle 由 Process 持有(strong ref),
+            // 直到 Process deinit 才释放 fd。UI 返回 true,不需要立即关。
             return true
         } catch {
+            fputs("[BackendShutdown] failed to start translate_stream: \(error)\n", stderr)
+            try? stdoutHandle.close()
+            try? stderrHandle.close()
             return false
         }
     }

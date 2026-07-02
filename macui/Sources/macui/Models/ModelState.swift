@@ -34,6 +34,11 @@ final class ModelState: ObservableObject {
     struct ModelInfo: Identifiable, Equatable {
         let id: String
         let displayName: String
+        // 跟 whicc.py:_detect_backend 同款:实际只输出 "qwen3" / "nemotron" 两个值。
+        // 之前注释说 "whisper" 是历史遗留 — Python 端 2026-06 删了 whisper 路径,
+        // Swift 端默认值 "whisper" 没人看但留着是个坑(任何不匹配 qwen/nemotron
+        // 的模型都会被标成 "whisper",误导 UI)。改成跟 Python 对齐:不匹配时
+        // 退回 "qwen3"(跟 whicc.py:_detect_backend line 65 同款兜底)。
         let backend: String   // "qwen3" | "nemotron"
         let kind: Kind        // 区分 ASR 主模型 vs 辅助模型
         let sizeBytes: Int64
@@ -53,12 +58,12 @@ final class ModelState: ObservableObject {
         }
 
         /// 跟 `whicc.py:_detect_backend` 同款逻辑——保持 Swift 端和
-        /// Python 端对 backend 的判断一致。
+        /// Python 端对 backend 的判断一致。Python 端 (whicc.py:60-65)
+        /// 只输出 "nemotron" / "qwen3" 两个值,Swift 端兜底也用 "qwen3"。
         static func detectBackend(_ id: String) -> String {
             let lower = id.lowercased()
             if lower.contains("nemotron") { return "nemotron" }
-            if lower.contains("qwen3") || lower.contains("qwen") { return "qwen3" }
-            return "whisper"
+            return "qwen3"
         }
 
         /// 模型类型判断：按模型名关键字识别

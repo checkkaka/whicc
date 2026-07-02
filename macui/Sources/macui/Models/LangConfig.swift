@@ -440,13 +440,17 @@ final class LangConfig: ObservableObject {
             // hard-coded 默认值,不会让旧用户的样式突变。
             if let color = json["subtitle_color"] as? String { self.subtitleColor = color }
             if let hex = json["custom_color_hex"] as? String { self.customColorHex = hex }
-            if let v = json["trans_font_size"] as? Double, v > 0 { self.transFontSize = CGFloat(v) }
-            if let v = json["src_font_size"] as? Double, v > 0 { self.srcFontSize = CGFloat(v) }
-            if let v = json["bg_opacity"] as? Double, v > 0 { self.bgOpacity = CGFloat(v) }
-            if let v = json["strong_shadow_opacity"] as? Double, v > 0 { self.strongShadowOpacity = v }
-            if let v = json["soft_shadow_opacity"] as? Double, v > 0 { self.softShadowOpacity = v }
-            if let v = json["strong_shadow_radius"] as? Double, v > 0 { self.strongShadowRadius = CGFloat(v) }
-            if let v = json["soft_shadow_radius"] as? Double, v > 0 { self.softShadowRadius = CGFloat(v) }
+            // `v >= 0` 接受合法的 0(用户明确想"不要阴影"或"完全透明")。
+            // 之前用 `v > 0` 是 falsy-zero check,把 0 当成"未设置",用默认覆盖,
+            // 用户手编 lang_config.json 设 0 就被静默丢弃。负数仍视为非法
+            // (跟之前一样拒绝 — 负 size / opacity 渲染无意义)。
+            if let v = json["trans_font_size"] as? Double, v >= 0 { self.transFontSize = CGFloat(v) }
+            if let v = json["src_font_size"] as? Double, v >= 0 { self.srcFontSize = CGFloat(v) }
+            if let v = json["bg_opacity"] as? Double, v >= 0 { self.bgOpacity = CGFloat(v) }
+            if let v = json["strong_shadow_opacity"] as? Double, v >= 0 { self.strongShadowOpacity = v }
+            if let v = json["soft_shadow_opacity"] as? Double, v >= 0 { self.softShadowOpacity = v }
+            if let v = json["strong_shadow_radius"] as? Double, v >= 0 { self.strongShadowRadius = CGFloat(v) }
+            if let v = json["soft_shadow_radius"] as? Double, v >= 0 { self.softShadowRadius = CGFloat(v) }
         }
     }
 
@@ -468,13 +472,14 @@ final class LangConfig: ObservableObject {
         if let src = json["audio_source"] as? String { self.audioSource = src }
         if let color = json["subtitle_color"] as? String { self.subtitleColor = color }
         if let hex = json["custom_color_hex"] as? String { self.customColorHex = hex }
-        if let v = json["trans_font_size"] as? Double, v > 0 { self.transFontSize = CGFloat(v) }
-        if let v = json["src_font_size"] as? Double, v > 0 { self.srcFontSize = CGFloat(v) }
-        if let v = json["bg_opacity"] as? Double, v > 0 { self.bgOpacity = CGFloat(v) }
-        if let v = json["strong_shadow_opacity"] as? Double, v > 0 { self.strongShadowOpacity = v }
-        if let v = json["soft_shadow_opacity"] as? Double, v > 0 { self.softShadowOpacity = v }
-        if let v = json["strong_shadow_radius"] as? Double, v > 0 { self.strongShadowRadius = CGFloat(v) }
-        if let v = json["soft_shadow_radius"] as? Double, v > 0 { self.softShadowRadius = CGFloat(v) }
+        // 跟 load() 同款 `v >= 0`(接受合法的 0)
+        if let v = json["trans_font_size"] as? Double, v >= 0 { self.transFontSize = CGFloat(v) }
+        if let v = json["src_font_size"] as? Double, v >= 0 { self.srcFontSize = CGFloat(v) }
+        if let v = json["bg_opacity"] as? Double, v >= 0 { self.bgOpacity = CGFloat(v) }
+        if let v = json["strong_shadow_opacity"] as? Double, v >= 0 { self.strongShadowOpacity = v }
+        if let v = json["soft_shadow_opacity"] as? Double, v >= 0 { self.softShadowOpacity = v }
+        if let v = json["strong_shadow_radius"] as? Double, v >= 0 { self.strongShadowRadius = CGFloat(v) }
+        if let v = json["soft_shadow_radius"] as? Double, v >= 0 { self.softShadowRadius = CGFloat(v) }
     }
 
     private func save() {

@@ -344,6 +344,16 @@ final class OverlayState: ObservableObject {
     // MARK: - Event dispatch
 
     /// Apply a translation event from `translation_events.jsonl`.
+    /// 这个 watcher 处理的事件类型(由 translate_stream.py 写入):
+    /// - translation_partial (含 streaming token)
+    /// - translation_final / translation_reset
+    /// - translation_error
+    /// - init-* (启动 banner ping,见 BackendLauncher.writeStartupPings)
+    ///
+    /// 下面 switch 里的 `case "partial"` / `case "final"` / `case "status"`
+    /// 分支是为兼容历史 whicc.py 已经合并的事件流写的,当前 main.swift args
+    /// 下走不到(events.jsonl 走 applyTranscription),但留着不影响行为 —
+    /// 改 args 时不需要同时改这段。
     func apply(_ event: TranslationEvent) {
         // Startup banner pings:BackendLauncher 在 .app 启动时写 init-…
         // caption events 跟用户对话。我们把它们挡在这,不进 `history`,
@@ -416,17 +426,44 @@ final class OverlayState: ObservableObject {
         }
     }
 
-    /// Fast path: ASR-only partials from the secondary transcription file.
+    /// Fast path: ASR-only events from the secondary transcription file
+    /// (events.jsonl, written by whicc.py)。状态/部分识别走这条路。
+    /// 字幕最终提交走 apply() 那条 (translation_final 带翻译) — 详见下。
+    ///
+    /// 历史:之前一度让这里 commit ASR final,但导致翻译模式下 UI 抖一下
+    /// (commit 一个"无翻译"caption → 紧接着 apply 的 translation_final 再
+    /// commit 一个"有翻译"caption 顶掉它,正式字幕先显示原文 → 闪现翻译)。
+    ///
+    /// 那次引入的理由是"修纯 ASR 模式下字幕卡 draft",但忘了:
+    /// - 打包模式 BackendLauncher 用 --force-enable 启动 translate_stream,
+    ///   即使 lang_config.translationEnabled=False,translate_stream 也跑。
+    /// - translate_stream 总是消费 ASR final 后发 translation_final。
+    /// - apply() 的 applyFinal 处理 translation_final — caption 由这里 commit。
+    /// 所以"纯 ASR 模式字幕卡 draft"在打包版本不成立,字幕永远由 apply() 走。
+    ///
+    /// dev mode (用户自己用 swift run) 下 lang_config.translationEnabled=False
+    /// 时 translate_stream 会 sys.exit(1) 退出,不参与转写。翻译流不在了
+    /// → ASR final 没人接 → 字幕卡 draft。这是 dev mode 期望行为还是 bug,
+    /// 留给 P0 #5 决定;此处不动避免误改产品语义。
+    ///
+    /// draft 清理:draftTranslatedText 可能在翻译模式残留(用户切回纯 ASR)。
+    /// partial 来时只在残留非 nil 时清,纯 ASR 模式下 draftTranslatedText
+    /// 始终 nil,跳过无意义的写。
     func applyTranscription(_ event: TranslationEvent) {
         switch event.eventType {
         case "partial":
             if let text = event.text, !text.isEmpty {
-                draftSourceText = text
+                draftSourceText = Self.deduplicateRepeated(text)
                 draftStablePrefixLen = 0
+                if draftTranslatedText != nil {
+                    draftTranslatedText = nil
+                }
             }
         case "status":
             handleStatus(event.status ?? "", colorKey: event.statusColor)
         default:
+            // events.jsonl 的 "final" 事件(纯 ASR final)走这里 ——
+            // 字幕最终提交由 apply() 的 translation_final 路径负责,不在这里。
             break
         }
     }
@@ -623,16 +660,21 @@ final class OverlayState: ObservableObject {
 
     func adjustBgOpacity(delta: CGFloat) {
         // 0.075 (almost transparent) ↔ 1.0 (opaque) ↔ 2.0 (pitch black)
+        // 三档循环,跨档时跳到下一档的端点。
         let minOpacity: CGFloat = 0.075
         var next = bgOpacity + delta
         if bgOpacity >= 1.99 && delta > 0 {
-            next = 0.075
+            // 在 2.0 端再加 → 跳到 0.075 重新开始循环
+            next = minOpacity
         } else if bgOpacity <= 0.08 && delta < 0 {
+            // 已经在最透明档(0.075)还想再减 → 跳到 2.0 纯黑
             next = 2.0
         } else if next > 1.01 && bgOpacity < 1.99 {
+            // 跨过 1.0 → 跳到 2.0 纯黑档
             next = 2.0
         } else if next < minOpacity - 0.01 {
-            next = 0.05
+            // 算上 delta 后低于下限 → 钳到 floor
+            next = minOpacity
         }
         bgOpacity = next
     }

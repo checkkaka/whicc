@@ -179,8 +179,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 进程的 open(O_APPEND) 在某些时序下会撞 macOS 的 inode
                 // 缓存,导致 ls 看不到文件但 whicc.py 持有 fd 继续写。
                 // 让后端自己创建文件,生命周期跟进程一致,更可靠。
-                let transFile = runDir + "/translation_events.jsonl"
                 let eventsFile = runDir + "/events.jsonl"
+                let transFile = runDir + "/translation_events.jsonl"
+                // 数据流(writeStartupPings + translate_stream 写 translation_*
+                // 到 translation_events.jsonl;whicc.py 写 ASR partial/final/status
+                // 到 events.jsonl)。
+                //
+                // 订阅路径(parseConfig 把 positional.first → eventsPath,
+                // --trans 值 → transEventsPath):
+                // - eventsPath = translation_events.jsonl → watcher A → apply()
+                //   apply() 处理 init-* pings (banner 工作 + 1.8s 自动 dismiss)
+                //   和 translation_partial/final/reset (draft 累积 + 提交 caption
+                //   带翻译)。apply() 里 case "partial"/"final"/"status" 分支
+                //   是为历史 ASR 兼容留的 dead code,当前 args 下走不到。
+                // - transEventsPath = events.jsonl → watcher B → applyTranscription()
+                //   ASR-only fast path:partial 写 draftSourceText、status 触发
+                //   状态更新。final 事件不 commit,由 translate_stream 消费后
+                //   通过 translation_final 走 apply() 提交带翻译的 caption。
+                //
+                // 为什么 positional 是 translation_events.jsonl?
+                // banner 工作依赖 watcher A 看到 init-* pings,而 init-*
+                // pings 写在 translation_events.jsonl (BackendLauncher
+                // .writeStartupPings,line 183) —— events.jsonl 不含
+                // init-* pings。如果 positional 是 events.jsonl,
+                // banner 永远不工作。
                 args = [args[0], transFile, "--trans", eventsFile,
                         "--glossary", AppPaths.srcDir,
                         "--x", "15", "--y", "1", "--w", "70", "--h", "13"]
