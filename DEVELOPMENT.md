@@ -13,6 +13,7 @@
 - [日志与排查](#日志与排查)
 - [核心机制](#核心机制)
 - [路线图](#路线图)
+- [本地化与翻译（i18n）](#本地化与翻译i18n)
 - [打包成 macOS .app](#打包成-macos-app)
 
 ## 开发模式启动
@@ -332,6 +333,151 @@ grep -oP '\d+ms'    /tmp/whicc-out/logs/translate-stream.log | sort -n | tail -2
 - **Push-style streaming encoder**：重写 mlx-audio 内部流式编码器，支持真正的实时麦克风输入（目前是基于 chunk 的）
 - **Incremental mel spectrogram caching**：O(n²) → O(n)，长音频场景下延迟降一档
 - **Speaker diarization**：NVIDIA Sortformer v2.1，多人对话场景区分发言人
+
+## 本地化与翻译（i18n）
+
+whicc UI 字符串走 SwiftUI 的 `LocalizedStringKey` + `Localizable.strings` 翻译表，**自动跟随 macOS 系统语言**。所有面向用户的字符串（包括 Settings 窗 + HUD 字幕栏）都通过这套机制本地化。
+
+加新语言**不需要改任何 Swift 代码**——只用复制 + 翻译一个文件。
+
+### 文件结构
+
+```
+macui/Sources/macui/Resources/
+└── en.lproj/
+    └── Localizable.strings   # 191 条 key，每条中文字面量 → 英文翻译
+```
+
+加新语言（以法语为例）就是新建 `fr.lproj/Localizable.strings`：
+
+```bash
+mkdir macui/Sources/macui/Resources/fr.lproj
+cp macui/Sources/macui/Resources/en.lproj/Localizable.strings \
+   macui/Sources/macui/Resources/fr.lproj/Localizable.strings
+```
+
+xcodegen 自动扫描所有 `*.lproj` 目录加入 Copy Bundle Resources build phase，**不需要改 `project.yml`**。`Package.swift` 也已声明 `defaultLocalization: "zh-Hans"`，SwiftPM 也认新目录。
+
+### 翻译流程
+
+打开新建的 `<lang>.lproj/Localizable.strings`，每行格式：
+
+```
+"<key>" = "<value>";
+```
+
+- **左边 `<key>` 不动** —— 它是 Swift 源码里的中文字面量，跟代码 1:1 对应。
+- **只改右边 `<value>`**，填你目标语言的翻译。
+
+例（en → fr）：
+
+```
+"字体" = "Font";                              → "字体" = "Police";
+"保存并重启翻译服务" = "Save and restart..."; → "保存并重启翻译服务" = "Enregistrer et redémarrer...";
+```
+
+### Locale ID 选择
+
+用 [BCP-47](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPInternational/LanguageandLocaleIDs/LanguageandLocaleIDs.html) 标识符：
+
+| 语言 | 目录名 |
+|---|---|
+| 英语（默认） | `en.lproj` |
+| 法语 | `fr.lproj` |
+| 日语 | `ja.lproj` |
+| 德语 | `de.lproj` |
+| 简体中文 | `zh-Hans.lproj`（**当前就是中文 fallback**，建了反而绕路，见下） |
+| 繁体中文 | `zh-Hant.lproj` |
+| 西班牙语 | `es.lproj` |
+| 阿拉伯语 | `ar.lproj` |
+| 葡萄牙语（巴西） | `pt-BR.lproj` |
+
+### 关于中文 fallback
+
+代码里所有 UI 字符串字面量是**中文**。SwiftUI 查表 fallback 链：
+
+```
+user locale → development region (en) → 代码字面量 (中文)
+```
+
+也就是说：
+- zh-CN 系统 → 直接显示中文（代码字面量）
+- en 系统 → 查 en.lproj 表
+- fr 系统 → 查 fr.lproj 表
+- fr 系统 + 某 key 漏翻译 → fallback 到 en.lproj；en 也漏 → fallback 中文
+
+**所以不需要建 `zh-Hans.lproj`**。建了反而让 fallback 链变成「zh → en」绕远。
+
+### 校验
+
+```bash
+# 1. plutil 语法校验（缺分号 / 引号不匹配会报错）
+plutil -lint macui/Sources/macui/Resources/fr.lproj/Localizable.strings
+
+# 2. 验证每个 key 在源码里有对应字面量（防拼写错误）
+python3 -c "
+import re, pathlib
+keys = []
+for line in pathlib.Path('macui/Sources/macui/Resources/fr.lproj/Localizable.strings').open():
+    m = re.match(r'\"((?:[^\"\\\\]|\\\\.)*)\"\s*=\s*\"', line.strip())
+    if m: keys.append(m.group(1))
+src = list(pathlib.Path('macui/Sources/macui/').rglob('*.swift'))
+unknown = [k for k in keys if not any(k in s.read_text() for s in src)]
+print('Unknown keys:', unknown)
+"
+
+# 3. 构建 + 测试
+xcodegen generate --spec project.yml --project .
+xcodebuild -project whicc.xcodeproj -scheme whicc -configuration Release \
+    -derivedDataPath build clean build
+```
+
+### 测试翻译
+
+构建完后切换系统语言：
+
+1. **系统设置 → 通用 → 语言与地区**
+2. 把目标语言拖到「首选语言」列表顶部
+3. **完全退出并重启 whicc.app**（应用启动时缓存 locale，重启前不会切换）
+4. 打开 Settings 窗（⌘,）→ 看到对应翻译即成功
+
+### 翻译时不要动的
+
+- **品牌名**：`whicc` 本身、`Qwen3-ASR`、`Nemotron` 等模型 ID、`SF Pro Rounded` / `Times New Roman` 等字体名（这些都是 proper nouns）
+- **`LangItem.label`**：33 种语言**自身**的名字（English / 中文 / 日本語 / हिन्दी / Tiếng Việt 等），按语言本身 native-script 写，不翻译成当地语言
+- **左右大括号** `{}` 或 `%lld` 之类的占位符（如有）
+
+### 复数语法（Phase 2，未上）
+
+当前一些动态计数字符串（"5 entries"、"3 个 ASR 模型"）用 `Text + Text` 拼接，数字 verbatim，前后静态片段查表。**这意味着英文 locale 下 "1 entry" 也会显示成 "1 entries"**——因为我们没用 `.stringsdict` plural rule。
+
+英文 en 复数形态（1 item vs 5 items）的正确处理要 `.stringsdict` + `String(format:)`，是 Phase 2 工作。如果你的语言复数语法复杂（阿拉伯语 6 种、波兰语 3 种），**强烈建议先开 issue 讨论**，再决定上不上 stringsdict。当前阶段：先做翻译，复数不一致可以接受。
+
+### 维护者工具
+
+合并 i18n PR 前，跑：
+
+```bash
+# 1. plutil 校验（CI 可加这一行）
+plutil -lint macui/Sources/macui/Resources/<lang>.lproj/Localizable.strings
+
+# 2. 自动验证所有 key 都有源字符串对应
+# （脚本见上「校验」第 2 步）
+
+# 3. 增量构建确认没破坏现有 en locale
+xcodebuild -project whicc.xcodeproj -scheme whicc -configuration Release \
+    -derivedDataPath build build
+```
+
+不要接受"PR 同时改了 Swift 代码"——i18n 翻译 PR 应当**只动 .strings 文件**，跨文件改动容易回归 en locale。
+
+### 长期演进
+
+- **5 个语种以内**：手工 PR 即可，无需翻译平台
+- **5+ 个语种**：考虑接入 [Weblate](https://weblate.org/)（开源）或 Crowdin（商业）—— 翻译者用网页 UI 翻译，自动合并 PR，支持 plural rules
+- **Phase 2**：`Localizable.stringsdict` 处理英文等复数语法 + Apple 推荐的 `Text("^[\(N) item](inflect: true)")` 形式，彻底消除 `Text + Text` deprecation warnings
+
+---
 
 ## 打包成 macOS .app
 
