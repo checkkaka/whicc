@@ -12,8 +12,8 @@ struct SettingsView: View {
 
     enum Pane: String, CaseIterable, Identifiable {
         case appearance = "外观"
-        case model  = "本机模型"
-        case server = "外接翻译模型"
+        case model  = "语音识别模型"
+        case server = "翻译模型"
         case hermes = "Hermes"
         var id: String { rawValue }
 

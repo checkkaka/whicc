@@ -15,7 +15,6 @@ struct AppearancePane: View {
     private static let defaultSrcFontSize: CGFloat = 18
     private static let defaultStyle: OverlayStyle = .white
     private static let defaultBgOpacity: CGFloat = 0.85
-    private static let defaultLang: String = "auto"
 
     var body: some View {
         SettingsDetailContainer {
@@ -50,9 +49,6 @@ struct AppearancePane: View {
 
                 // 窗体透明度
                 opacityCard
-
-                // 目标语言
-                languageCard
             }
         }
     }
@@ -759,93 +755,4 @@ private var customColorButton: some View {
         )
     }
 
-    // MARK: - 语言（源语言 + 目标语言，两个独立 picker）
-
-    private var languageCard: some View {
-        SettingsCard {
-            SettingsSectionHeader(
-                icon: "globe",
-                title: "语言",
-                tint: .accentColor,
-                trailing: {
-                    resetButton(help: "恢复默认（源/目标都是自动检测）") {
-                        langConfig.setSourceLang(Self.defaultLang)
-                        langConfig.setLang(Self.defaultLang)
-                    }
-                }
-            )
-            VStack(alignment: .leading, spacing: 10) {
-                // 源语言：原文识别目标。"auto" = Python 后端自己检测。
-                languagePickerRow(
-                    label: "源语言",
-                    binding: sourceLangBinding,
-                    help: "原文语言（auto = ASR 自动检测；固定后跳过检测）"
-                )
-                // 目标语言：译文。"auto" = 根据源自动选。
-                languagePickerRow(
-                    label: "目标语言",
-                    binding: targetLangBinding,
-                    help: "译文语言（auto = 按源选对：中文→英文，其他→中文）"
-                )
-            }
-            Text("切换后需重启后端（whicc.py / translate_stream）生效。")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// 通用语言 picker 行：左侧标签 + 右侧 menu picker。menu picker
-    /// 按 LANGUAGE_GROUPS 自动分组。
-    @ViewBuilder
-    private func languagePickerRow(
-        label: String,
-        binding: Binding<String>,
-        help: String
-    ) -> some View {
-        HStack(spacing: 12) {
-            Text(label)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 60, alignment: .leading)
-                .help(help)
-            Picker(label, selection: binding) {
-                Text("自动检测").tag("auto")
-                ForEach(LANGUAGE_GROUPS) { group in
-                    Section(group.name) {
-                        ForEach(group.langs) { lang in
-                            Text(lang.label).tag(lang.id)
-                        }
-                    }
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-        }
-    }
-
-    /// 源语言 binding——写 state.sourceLang + lang_config.json 的 source_lang 键。
-    private var sourceLangBinding: Binding<String> {
-        Binding(
-            get: { langConfig.sourceLang },
-            set: { langConfig.setSourceLang($0) }
-        )
-    }
-
-    /// 目标语言 binding——跟原来一样。
-    private var targetLangBinding: Binding<String> {
-        Binding(
-            get: { langConfig.targetLang },
-            set: { langConfig.setLang($0) }
-        )
-    }
-
-    /// 目标语言已经在 ServerPane / HermesPane / GlossaryPane 写过的路径上
-    /// 走 langConfig.setLang；这里复用 LangConfig 已有的 targetLang 字段
-    /// 和 setter，Pane 之间共享同一份持久化值。
-    private var languageBinding: Binding<String> {
-        Binding(
-            get: { langConfig.targetLang },
-            set: { langConfig.setLang($0) }
-        )
-    }
 }

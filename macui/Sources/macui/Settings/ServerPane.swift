@@ -173,6 +173,48 @@ struct ServerPane: View {
                     .disabled(restartInFlight)
                 }
             }
+
+            // 语言(源 + 目标) — 从 AppearancePane 搬过来。源语言控制
+            // ASR 识别目标,目标语言控制翻译输出,两者都跟翻译服务强相关,
+            // 放在这一页让用户改完翻译服务 URL/模型后,顺手配语言。
+            SettingsCard {
+                SettingsSectionHeader(
+                    icon: "globe",
+                    title: "语言",
+                    tint: .accentColor,
+                    trailing: {
+                        Button {
+                            langConfig.setSourceLang("auto")
+                            langConfig.setLang("auto")
+                        } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 22, height: 22)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("恢复默认(源/目标都是自动检测)")
+                    }
+                )
+                VStack(alignment: .leading, spacing: 10) {
+                    // 源语言:原文识别目标。"auto" = Python 后端自己检测。
+                    languagePickerRow(
+                        label: "源语言",
+                        binding: sourceLangBinding,
+                        help: "原文语言(auto = ASR 自动检测;固定后跳过检测)"
+                    )
+                    // 目标语言:译文。"auto" = 根据源自动选。
+                    languagePickerRow(
+                        label: "目标语言",
+                        binding: targetLangBinding,
+                        help: "译文语言(auto = 按源选对:中文→英文,其他→中文)"
+                    )
+                }
+                Text("切换后需重启后端(whicc.py / translate_stream)生效。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
         }
         // 进入外接翻译模型页面时,主动测连通性 + 拉模型列表 ——
         // 用户反馈"不点击刷新按钮就不显示当前生效那行"是反逻辑:
@@ -434,6 +476,54 @@ struct ServerPane: View {
             }
         }
     }
+
+    // MARK: - 语言 picker (从 AppearancePane 搬过来)
+
+    /// 通用语言 picker 行:左侧标签 + 右侧 menu picker。menu picker
+    /// 按 LANGUAGE_GROUPS 自动分组。
+    @ViewBuilder
+    private func languagePickerRow(
+        label: String,
+        binding: Binding<String>,
+        help: String
+    ) -> some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+                .help(help)
+            Picker(label, selection: binding) {
+                Text("自动检测").tag("auto")
+                ForEach(LANGUAGE_GROUPS) { group in
+                    Section(group.name) {
+                        ForEach(group.langs) { lang in
+                            Text(lang.label).tag(lang.id)
+                        }
+                    }
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+        }
+    }
+
+    /// 源语言 binding——写 lang_config.json 的 source_lang 键。
+    private var sourceLangBinding: Binding<String> {
+        Binding(
+            get: { langConfig.sourceLang },
+            set: { langConfig.setSourceLang($0) }
+        )
+    }
+
+    /// 目标语言 binding——跟 HermesPane / GlossaryPane 同路径。
+    private var targetLangBinding: Binding<String> {
+        Binding(
+            get: { langConfig.targetLang },
+            set: { langConfig.setLang($0) }
+        )
+    }
+
 }
 
 // MARK: - Plain row (every keystroke commits)
