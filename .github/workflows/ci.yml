@@ -1,0 +1,144 @@
+# whicc CI
+#
+# On every push to main and every PR, run on a macOS runner:
+#   1. xcodebuild clean build (verify Swift + macOS 26 deployment target)
+#   2. plutil -lint on every .lproj/Localizable.strings (catch missing semicolons / broken quotes)
+#   3. Python key check: every key in any *.lproj must match a Chinese literal in source
+#
+# venv-standalone is .gitignored, so CI just installs deps fresh each run:
+#   python3.13 -m venv /tmp/whicc-venv
+#   /tmp/whicc-venv/bin/pip install -r requirements.txt
+#
+# This is the minimum bar for open-source PR review — without it, contributors
+# can't tell whether their i18n PR actually broke en locale before maintainer
+# gets paged.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS build + i18n lint
+    runs-on: macos-15   # Xcode 26.x, supports deployment target macOS 26.0
+
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      # ---- Python deps (used by xcodegen preBuildScripts that embed backend) ----
+      # The Xcode preBuildScripts in project.yml runs `cp -R venv-standalone/`
+      # to copy Python into the .app bundle. CI re-creates venv-standalone
+      # from requirements.txt so we don't ship a 1.3GB binary in git.
+      - name: Setup Python 3.13 venv
+        run: |
+          python3.13 -m venv /tmp/whicc-venv
+          /tmp/whicc-venv/bin/pip install --upgrade pip wheel
+          /tmp/whicc-venv/bin/pip install -r requirements.txt
+
+      - name: Symlink venv-standalone for build script
+        run: ln -sfn /tmp/whicc-venv venv-standalone
+
+      # ---- xcodegen: regenerate whicc.xcodeproj from project.yml ----
+      # .xcodeproj is .gitignored (each dev regenerates locally), so CI runs
+      # xcodegen before xcodebuild. Pin a specific version for reproducibility.
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml --project .
+
+      # ---- Main build (Release, mirrors DEVELOPMENT.md "快速打包") ----
+      - name: Build whicc (Release)
+        run: |
+          xcodebuild \
+            -project whicc.xcodeproj \
+            -scheme whicc \
+            -configuration Release \
+            -derivedDataPath build \
+            clean build
+
+      # ---- i18n lint: every .lproj/Localizable.strings must parse ----
+      # Catches: missing semicolons, broken quotes, encoding issues. The
+      # plutil binary is built into macOS — no extra install needed.
+      - name: Validate Localizable.strings syntax
+        run: |
+          set -euo pipefail
+          for f in macui/Sources/macui/Resources/*.lproj/Localizable.strings; do
+            echo "lint: $f"
+            plutil -lint "$f"
+          done
+
+      # ---- i18n content check: every key must match a Chinese literal in
+      # Swift source. Catches typos in keys ("复制译文" vs "复制译问") and
+      # orphan keys (translation key that no longer has a source site).
+      - name: Verify keys match Swift source literals
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib, sys
+
+          strings_files = list(pathlib.Path("macui/Sources/macui/Resources").glob("*.lproj/Localizable.strings"))
+          src_files = list(pathlib.Path("macui/Sources/macui").rglob("*.swift"))
+
+          def parse_keys(path):
+              keys = []
+              for line in path.read_text().splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("/*") or line.startswith("//") or line.startswith("*"):
+                      continue
+                  m = re.match(r'"((?:[^"\\]|\\.)*)"\s*=\s*"', line)
+                  if m:
+                      keys.append(m.group(1))
+              return keys
+
+          errors = []
+          for sf in strings_files:
+              keys = parse_keys(sf)
+              # Built-in keys that are NOT Chinese source literals
+              # (e.g. Pane.localizedTitle returns English literals like
+              # "Appearance" — those don't appear as Text("Appearance") in
+              # source). Skip them.
+              non_source = {
+                  "Appearance", "Speech Recognition Model", "Translation Model", "Hermes",
+                  "settings_window_title", "menu_preferences", "menu_quit", "menu_file",
+                  "menu_close", "menu_edit", "menu_edit_cut", "menu_edit_copy",
+                  "menu_edit_paste", "menu_edit_select_all",
+              }
+              for k in keys:
+                  if k in non_source:
+                      continue
+                  if not any(k in sf.read_text() for sf in src_files):
+                      errors.append(f"{sf.name}: orphan key {k!r} (not in source)")
+
+          if errors:
+              print("Orphan keys detected:", file=sys.stderr)
+              for e in errors:
+                  print("  " + e, file=sys.stderr)
+              sys.exit(1)
+
+          total = sum(len(parse_keys(sf)) for sf in strings_files)
+          print(f"All {len(strings_files)} lproj files OK; {total} total keys verified.")
+          PYEOF
+
+      # ---- Optional: upload built .app as artifact for manual download ----
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whicc-${{ github.sha }}
+          path: build/Build/Products/Release/whicc.app
+          retention-days: 7
+          if-no-files-found: error

@@ -8,6 +8,7 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
+[![CI](https://github.com/OWNER/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 
 <!-- TODO: 替换为实际截图/GIF,建议放 2 个:
      1) macOS 字幕浮窗运行时截图(双语字幕 + 浮岛样式)

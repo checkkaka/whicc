@@ -14,6 +14,7 @@
 - [核心机制](#核心机制)
 - [路线图](#路线图)
 - [本地化与翻译（i18n）](#本地化与翻译i18n)
+- [CI / GitHub Actions](#ci--github-actions)
 - [打包成 macOS .app](#打包成-macos-app)
 
 ## 开发模式启动
@@ -476,6 +477,50 @@ xcodebuild -project whicc.xcodeproj -scheme whicc -configuration Release \
 - **5 个语种以内**：手工 PR 即可，无需翻译平台
 - **5+ 个语种**：考虑接入 [Weblate](https://weblate.org/)（开源）或 Crowdin（商业）—— 翻译者用网页 UI 翻译，自动合并 PR，支持 plural rules
 - **Phase 2**：`Localizable.stringsdict` 处理英文等复数语法 + Apple 推荐的 `Text("^[\(N) item](inflect: true)")` 形式，彻底消除 `Text + Text` deprecation warnings
+
+---
+
+## CI / GitHub Actions
+
+`.github/workflows/ci.yml` 在 push / PR 时跑：
+
+1. **macOS 26 build** — `macos-15` runner + `xcodebuild -configuration Release` 完整 build，含 preBuildScripts 嵌入 Python 后端的步骤
+2. **i18n syntax lint** — `plutil -lint` 校验每个 `*.lproj/Localizable.strings`（缺分号 / 引号不匹配会报错）
+3. **i18n content check** — Python 脚本扫所有 key，确认每个 key 都对应 Swift 源码里的中文字面量，捕获"orphan key"（翻译 PR 引入了代码里不存在的 key）
+4. **Artifact upload** — 构建好的 `whicc.app` 上传 7 天，可手动下载测试
+
+CI 在 fresh macOS VM 上跑，**不依赖仓库里任何大文件**：`venv-standalone/` 是 `.gitignore` 的，CI 每次跑 `python3.13 -m venv` 重建然后软链接过去；`.xcodeproj` 也是 `.gitignore` 的，CI 跑 `xcodegen generate` 重新生成。
+
+加 CI 状态徽章到 README：
+
+```markdown
+[![CI](https://github.com/OWNER/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+```
+
+`OWNER` 替换成你的 GitHub 用户名。
+
+本地复现 CI 的 4 个步骤：
+
+```bash
+plutil -lint macui/Sources/macui/Resources/*.lproj/Localizable.strings
+
+# python i18n key check
+python3 - <<'PYEOF'
+import re, pathlib
+keys = []
+for line in pathlib.Path("macui/Sources/macui/Resources/en.lproj/Localizable.strings").open():
+    m = re.match(r'"((?:[^"\\]|\\.)*)"\s*=\s*"', line.strip())
+    if m: keys.append(m.group(1))
+src = list(pathlib.Path("macui/Sources/macui/").rglob("*.swift"))
+orphan = [k for k in keys if not any(k in s.read_text() for s in src)]
+print("orphan:", orphan or "none")
+PYEOF
+
+# 完整 build
+xcodegen generate --spec project.yml --project .
+xcodebuild -project whicc.xcodeproj -scheme whicc -configuration Release \
+    -derivedDataPath build clean build
+```
 
 ---
 
