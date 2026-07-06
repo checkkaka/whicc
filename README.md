@@ -8,7 +8,7 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
-[![CI](https://github.com/OWNER/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[![CI](https://github.com/nbzz/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 
 <!-- 视觉资产 (文件说明见 docs/screenshots/README.md):
      1) docs/screenshots/icon.png   — 顶部 hero image, 应用图标
@@ -233,3 +233,7 @@ MIT License — 见 [LICENSE](LICENSE)。
 - [NVIDIA Nemotron](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) — ASR 模型
 - [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-4bit) — ASR 模型
 - [LM Studio](https://lmstudio.ai/) — 本地 LLM 运行器
+
+---
+
+> [LINUX DO](https://linux.do/) —— 新的理想型社区,技术爱好者的聚集地。
