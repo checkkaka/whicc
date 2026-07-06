@@ -9,6 +9,7 @@
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
 [![CI](https://github.com/nbzz/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[English](README_EN.md) · [Docs](DEVELOPMENT.md)
 
 <!-- 视觉资产 (文件说明见 docs/screenshots/README.md):
      1) docs/screenshots/icon.png   — 顶部 hero image, 应用图标
