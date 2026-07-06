@@ -10,15 +10,16 @@
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
 [![CI](https://github.com/OWNER/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 
-<!-- 截图: 放在 docs/screenshots/,文件名规范见 DEVELOPMENT.md#截图与录屏规范
-     1) docs/screenshots/demo.png    — 主字幕窗体静态截图 (双语字幕 + 浮岛样式)
-     2) docs/screenshots/demo.gif    — 任意外语视频上叠加运行的 15s GIF
+<!-- 视觉资产 (文件说明见 docs/screenshots/README.md):
+     1) docs/screenshots/icon.png   — 顶部 hero image, 应用图标
+     2) docs/screenshots/demo.mov   — 38s 演示视频, 用 <video> 标签嵌入
 -->
 <p align="center">
-  <img src="docs/screenshots/demo.png" alt="whicc running on macOS — bilingual subtitle floating on top of any video" width="720">
+  <img src="docs/screenshots/icon.png" alt="whicc app icon" width="240">
 </p>
+
 <p align="center">
-  <img src="docs/screenshots/demo.gif" alt="whicc running with a foreign-language video" width="720">
+  <video src="docs/screenshots/demo.mov" controls width="720" preload="metadata"></video>
 </p>
 
 **whicc** = **whi**(sper) + **cc**(closed captions) — 看外语视频时,屏幕上永远挂着一个本地算力撑起来的翻译字幕。
