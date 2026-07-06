@@ -29,13 +29,27 @@ concurrency:
 jobs:
   build:
     name: macOS build + i18n lint
-    runs-on: macos-15   # Xcode 26.x, supports deployment target macOS 26.0
+    runs-on: macos-15   # Default image ships with Xcode 16.x; we explicitly
+                        # install Xcode 26 below (project requires macOS 26 SDK).
 
     timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ---- Install Xcode 26 (project uses macOS 26 SwiftUI APIs like
+      # GlassEffectContainer that don't exist in Xcode 16). Without
+      # this step, builds fail with "cannot find 'GlassEffectContainer'
+      # in scope" against the default Xcode 16 SDK that ships with
+      # macos-15 image. ----
+      - name: Setup Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.0"
+
+      - name: Select Xcode 26 as default
+        run: sudo xcode-select -s /Applications/Xcode_26.0.app
 
       - name: Show Xcode version
         run: xcodebuild -version
