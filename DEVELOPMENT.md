@@ -15,6 +15,7 @@
 - [路线图](#路线图)
 - [本地化与翻译（i18n）](#本地化与翻译i18n)
 - [CI / GitHub Actions](#ci--github-actions)
+- [发布 Release](#发布-release)
 - [打包成 macOS .app](#打包成-macos-app)
 
 ## 开发模式启动
@@ -527,6 +528,84 @@ xcodegen generate --spec project.yml --project .
 xcodebuild -project whicc.xcodeproj -scheme whicc -configuration Release \
     -derivedDataPath build clean build
 ```
+
+---
+
+## 发布 Release
+
+`.github/workflows/release.yml` 由 git tag 触发（`v*` 模式匹配 `v0.1.0` / `v1.2.3` 等），自动 build + 压缩 + 上传 GitHub Release。
+
+### 发版流程
+
+```bash
+# 1. 准备 release commit (CHANGELOG / version bump / docs)
+git checkout main
+git pull
+# ... 改代码、commit ...
+
+# 2. 打 tag 并 push
+git tag v0.1.0
+git push origin v0.1.0
+
+# 3. 等 ~5 分钟, GitHub Actions 跑完
+#    - macos-15 runner 上 build Release
+#    - ditto zip 出 whicc-v0.1.0.app.zip
+#    - 生成 SHA256SUMS 校验文件
+#    - 自动创建 GitHub Release v0.1.0 + 上传 zip
+#    - 触发 softprops/action-gh-release 的 generate_release_notes
+#      (从上一次 tag 到现在的 merged PR 列表自动生成发布说明)
+```
+
+用户在 GitHub Releases 页面下载 zip → 解压 → 拖到 `/Applications/` → 双击启动。
+
+### ad-hoc 签名的限制
+
+发布版用 ad-hoc 签名（跟 `xcodebuild` 本地 build 一样），不申请 Developer ID。这意味着：
+
+- ✅ 不收费，不需 Apple Developer 账号
+- ✅ 普通 Mac 用户能直接装
+- ❌ **首次启动**要「右键 → 打开」绕过 Gatekeeper（不然 macOS 弹窗不让运行）
+- ❌ 不会被 macOS 自动信任 / quarantine 标记为"安全"
+
+适合个人项目 / 内测。要正式公开分发，再加：
+
+```yaml
+# 加到 release.yml 的 build 之后、zip 之前
+- name: Sign with Developer ID
+  env:
+    APPLE_ID: ${{ secrets.APPLE_ID }}
+    TEAM_ID: ${{ secrets.TEAM_ID }}
+    NOTARYTOOL_PASSWORD: ${{ secrets.NOTARYTOOL_PASSWORD }}
+  run: |
+    codesign --deep --options=runtime --sign "Developer ID Application: $TEAM_ID" \
+      build/Build/Products/Release/whicc.app
+    xcrun notarytool submit build/Build/Products/Release/whicc.app \
+      --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
+      --password "$NOTARYTOOL_PASSWORD" --wait
+    xcrun stapler staple build/Build/Products/Release/whicc.app
+```
+
+Apple Developer 账号年费 $99，公证（notarization）每个 release 几分钟。
+
+### 不在 git 里的 release assets
+
+13 MB `demo.mov` 当前进了 git（用户决定）。如果以后想给 release 瘦身：
+
+- 把 `demo.mov` 加进 `.gitignore`
+- 改 release.yml 上传前 step 用 `curl` 从外部拉（如 GitHub Release v0.0.x 的 asset）
+- 仓库保持小，release 自带 demo
+
+### 第一次 release
+
+现在仓库是空的，**没有** `v0.0.x` tag。第一个 release 流程：
+
+1. 第一次 push 到 GitHub（创建空 repo 之后）
+2. CI 跑过 build（验证基础）
+3. 手动打 `v0.1.0` tag
+4. 等 release workflow
+5. 第一次发版时 `whicc-v0.1.0.app.zip` 公开
+
+不需要先发 beta —— 用户量小的话直发。
 
 ---
 

@@ -1,0 +1,152 @@
+# whicc release workflow
+#
+# Triggered by pushing a tag matching `v*` (e.g. `v0.1.0`, `v1.2.3`).
+# Builds whicc.app, zips it, and uploads to GitHub Releases.
+#
+# Usage:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#   # wait ~5 min for the workflow to finish
+#   # GitHub Release v0.1.0 is created automatically with whicc.app.zip attached
+#
+# To avoid signing complexity (Developer ID + Apple notarization), this
+# builds ad-hoc signed only. Users will need to right-click → Open the
+# first time on macOS Gatekeeper. For wider distribution, add
+# `codesign --deep --options=runtime --sign "Developer ID Application: ..."`
+# and `xcrun notarytool submit ...` steps.
+#
+# This workflow REUSES the ci.yml build steps by calling the same
+# commands inline. We could extract to a composite action, but at the
+# cost of clarity for two workflows — keeping them separate is fine.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'   # v0.1.0, v1.2.3, etc.
+
+# Don't cancel mid-release; user is waiting for the artifact.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build + upload .app to GitHub Release
+    runs-on: macos-15
+
+    timeout-minutes: 45
+
+    permissions:
+      contents: write   # needed for softprops/action-gh-release to create the release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show tag + Xcode version
+        run: |
+          echo "Building ${{ github.ref_name }}"
+          git describe --tags --always
+          xcodebuild -version
+
+      # ---- Python deps (used by xcodegen preBuildScripts that embed backend) ----
+      # Same setup as ci.yml — fresh VM each run, recreate venv-standalone.
+      - name: Setup Python 3.13 venv
+        run: |
+          python3.13 -m venv /tmp/whicc-venv
+          /tmp/whicc-venv/bin/pip install --upgrade pip wheel
+          /tmp/whicc-venv/bin/pip install -r requirements.txt
+
+      - name: Symlink venv-standalone for build script
+        run: ln -sfn /tmp/whicc-venv venv-standalone
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml --project .
+
+      # ---- Main build (Release) ----
+      # This is the same command as DEVELOPMENT.md "快速打包". Build artifact
+      # ends up at build/Build/Products/Release/whicc.app.
+      - name: Build whicc (Release)
+        run: |
+          xcodebuild \
+            -project whicc.xcodeproj \
+            -scheme whicc \
+            -configuration Release \
+            -derivedDataPath build \
+            clean build
+
+      # ---- Sanity check: app bundle exists ----
+      - name: Verify .app bundle
+        run: |
+          ls -la build/Build/Products/Release/whicc.app
+          # Confirm executable is there
+          test -x build/Build/Products/Release/whicc.app/Contents/MacOS/whicc \
+            && echo "✓ executable present" \
+            || (echo "✗ executable missing"; exit 1)
+          # Confirm .lproj is bundled (CI lint passed earlier, but be paranoid)
+          ls build/Build/Products/Release/whicc.app/Contents/Resources/en.lproj/Localizable.strings
+
+      # ---- Compute size + checksum (for release notes) ----
+      - name: Compute bundle size + SHA256
+        id: metadata
+        run: |
+          SIZE=$(du -sh build/Build/Products/Release/whicc.app | cut -f1)
+          BYTES=$(du -sb build/Build/Products/Release/whicc.app | cut -f1)
+          SHA=$(shasum -a 256 build/Build/Products/Release/whicc.app | cut -d' ' -f1)
+          echo "size=$SIZE"
+          echo "bytes=$BYTES"
+          echo "sha=$SHA"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # ---- Zip the .app for distribution ----
+      # `ditto -c -k --sequesterRsrc --keepParent` is the canonical macOS way
+      # to bundle a .app. It preserves resource forks (rarely needed) and
+      # produces a zip that, when unzipped, gives a clean `whicc.app/` at
+      # the top level (no nested `whicc-0.1.0/whicc.app/`).
+      #
+      # --sequesterRsrc: combine resource fork into main file (modern macOS)
+      # --keepParent: include the whicc.app directory itself in the zip
+      # -c -k: create zip archive
+      - name: Zip .app bundle
+        run: |
+          cd build/Build/Products/Release
+          ditto -c -k --sequesterRsrc --keepParent whicc.app whicc-${{ github.ref_name }}.app.zip
+          ls -la whicc-${{ github.ref_name }}.app.zip
+
+      # ---- Generate SHA256SUMS for the release ----
+      - name: Generate SHA256SUMS file
+        run: |
+          cd build/Build/Products/Release
+          shasum -a 256 whicc-${{ github.ref_name }}.app.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      # ---- Create GitHub Release + upload assets ----
+      # softprops/action-gh-release handles both release creation and asset
+      # upload in one step. It uses GitHub's auto-generated release notes
+      # (which derive from merged PRs since the last tag) and lets us add
+      # extra notes via `body:`.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          # Use the tag name as the release title; users will see "v0.1.0"
+          name: ${{ github.ref_name }}
+          generate_release_notes: true   # auto-generate from merged PRs
+          body: |
+            **Size**: ${{ steps.metadata.outputs.size }}
+            **SHA256**: `${{ steps.metadata.outputs.sha }}`
+
+            Download `whicc-${{ github.ref_name }}.app.zip`, unzip, drag
+            `whicc.app` to `/Applications/`. First launch: right-click →
+            Open (Gatekeeper requires this for ad-hoc signed builds).
+          files: |
+            build/Build/Products/Release/whicc-${{ github.ref_name }}.app.zip
+            build/Build/Products/Release/SHA256SUMS
+          fail_on_unmatched_files: true
