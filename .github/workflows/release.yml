@@ -1,13 +1,15 @@
 # whicc release workflow
 #
 # Triggered by pushing a tag matching `v*` (e.g. `v0.1.0`, `v1.2.3`).
-# Builds whicc.app, zips it, and uploads to GitHub Releases.
+# Builds whicc.app, packages it into a .dmg via bin/build_dmg.sh, and
+# uploads to GitHub Releases with bilingual notes (zh first, en in
+# <details>).
 #
 # Usage:
-#   git tag v0.1.0
-#   git push origin v0.1.0
+#   git tag v0.1.1
+#   git push origin v0.1.1
 #   # wait ~5 min for the workflow to finish
-#   # GitHub Release v0.1.0 is created automatically with whicc.app.zip attached
+#   # GitHub Release v0.1.1 is created automatically with whicc-v0.1.1.dmg attached
 #
 # To avoid signing complexity (Developer ID + Apple notarization), this
 # builds ad-hoc signed only. Users will need to right-click → Open the
@@ -166,13 +168,32 @@ jobs:
           # Confirm .lproj is bundled (CI lint passed earlier, but be paranoid)
           ls build/Build/Products/Release/whicc.app/Contents/Resources/en.lproj/Localizable.strings
 
-      # ---- Compute size + checksum (for release notes) ----
-      - name: Compute bundle size + SHA256
+      # ---- Build .dmg for distribution ----
+      # bin/build_dmg.sh wraps the hdiutil dance: create UDRW → mount →
+      # ditto .app in → detach → convert to UDZO. Plain dmg layout
+      # (no custom Finder window) keeps the script simple; users get
+      # the standard mount → drag-to-Applications flow.
+      # -size 700m: whicc.app is ~566 MB (Python venv with mlx/numpy/scipy).
+      # Tag name is the version, e.g. v0.1.1 → "0.1.1".
+      - name: Build .dmg
+        run: |
+          chmod +x bin/build_dmg.sh
+          VERSION="${GITHUB_REF_NAME#v}"
+          bin/build_dmg.sh "$VERSION" \
+            "build/Build/Products/Release/whicc.app" \
+            "build/Build/Products/Release/whicc-${GITHUB_REF_NAME}.dmg"
+          ls -la "build/Build/Products/Release/whicc-${GITHUB_REF_NAME}.dmg"
+
+      # ---- Compute size + SHA256 of the .dmg (for release notes) ----
+      # The .dmg is what users download; the .app directory is internal.
+      - name: Compute .dmg size + SHA256
         id: metadata
         run: |
-          SIZE=$(du -sh build/Build/Products/Release/whicc.app | cut -f1)
-          BYTES=$(du -sb build/Build/Products/Release/whicc.app | cut -f1)
-          SHA=$(shasum -a 256 build/Build/Products/Release/whicc.app | cut -d' ' -f1)
+          cd build/Build/Products/Release
+          DMG="whicc-${GITHUB_REF_NAME}.dmg"
+          SIZE=$(du -sh "$DMG" | cut -f1)
+          BYTES=$(du -sb "$DMG" | cut -f1)
+          SHA=$(shasum -a 256 "$DMG" | cut -d' ' -f1)
           echo "size=$SIZE"
           echo "bytes=$BYTES"
           echo "sha=$SHA"
@@ -180,26 +201,11 @@ jobs:
           echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      # ---- Zip the .app for distribution ----
-      # `ditto -c -k --sequesterRsrc --keepParent` is the canonical macOS way
-      # to bundle a .app. It preserves resource forks (rarely needed) and
-      # produces a zip that, when unzipped, gives a clean `whicc.app/` at
-      # the top level (no nested `whicc-0.1.0/whicc.app/`).
-      #
-      # --sequesterRsrc: combine resource fork into main file (modern macOS)
-      # --keepParent: include the whicc.app directory itself in the zip
-      # -c -k: create zip archive
-      - name: Zip .app bundle
-        run: |
-          cd build/Build/Products/Release
-          ditto -c -k --sequesterRsrc --keepParent whicc.app whicc-${{ github.ref_name }}.app.zip
-          ls -la whicc-${{ github.ref_name }}.app.zip
-
       # ---- Generate SHA256SUMS for the release ----
       - name: Generate SHA256SUMS file
         run: |
           cd build/Build/Products/Release
-          shasum -a 256 whicc-${{ github.ref_name }}.app.zip > SHA256SUMS
+          shasum -a 256 whicc-${GITHUB_REF_NAME}.dmg > SHA256SUMS
           cat SHA256SUMS
 
       # ---- Create GitHub Release + upload assets ----
@@ -215,13 +221,26 @@ jobs:
           name: ${{ github.ref_name }}
           generate_release_notes: true   # auto-generate from merged PRs
           body: |
+            **大小**: ${{ steps.metadata.outputs.size }}
+            **SHA256**: `${{ steps.metadata.outputs.sha }}`
+
+            下载 `whicc-${{ github.ref_name }}.dmg`，双击挂载，把
+            `whicc.app` 拖到 `/Applications/`。首次启动：右键 → 打开
+            （Gatekeeper 对 ad-hoc 签名应用的要求）。
+
+            <details>
+            <summary>English</summary>
+
             **Size**: ${{ steps.metadata.outputs.size }}
             **SHA256**: `${{ steps.metadata.outputs.sha }}`
 
-            Download `whicc-${{ github.ref_name }}.app.zip`, unzip, drag
-            `whicc.app` to `/Applications/`. First launch: right-click →
-            Open (Gatekeeper requires this for ad-hoc signed builds).
+            Download `whicc-${{ github.ref_name }}.dmg`, double-click to
+            mount, drag `whicc.app` to `/Applications/`. First launch:
+            right-click → Open (Gatekeeper requires this for ad-hoc
+            signed builds).
+
+            </details>
           files: |
-            build/Build/Products/Release/whicc-${{ github.ref_name }}.app.zip
+            build/Build/Products/Release/whicc-${{ github.ref_name }}.dmg
             build/Build/Products/Release/SHA256SUMS
           fail_on_unmatched_files: true

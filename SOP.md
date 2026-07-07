@@ -2,7 +2,7 @@
 
 > 给其他 AI agent / 未来忘了细节的人读。按这个文件做发布，可以避开我已经踩过的 6 次连续 release build 失败。
 >
-> 适用范围：从 `main` 上发布一个稳定版本（e.g. `v0.2.0`），自动 build + 上传 `.app.zip` 到 GitHub Releases。
+> 适用范围：从 `main` 上发布一个稳定版本（e.g. `v0.2.0`），自动 build + 上传 `.dmg` 到 GitHub Releases（中文 notes 在前，英文用 `<details>` 折叠）。
 
 ---
 
@@ -113,7 +113,8 @@ export RELEASE_VERSION="0.2.0"
 
 ## 安装
 
-下载 `whicc-v0.2.0.app.zip`...
+下载 `whicc-v0.2.0.dmg`，双击挂载，把 `whicc.app` 拖到 `/Applications/`。
+首次启动：右键 → 打开（Gatekeeper 对 ad-hoc 签名应用的要求）。
 ```
 
 或者在 GitHub Release 自动生成（release.yml 用了 `generate_release_notes: true` —— 它会从 tag 之间 merged PR 自动整理）。
@@ -191,9 +192,9 @@ curl -s "https://api.github.com/repos/nbzz/whicc/releases/tags/$RELEASE_VERSION"
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'tag: {d[\"tag_name\"]}, assets: {len(d[\"assets\"])}')"
 ```
 
-**期望**：`tag: v0.2.0, assets: 2`（zip + SHA256SUMS）
+**期望**：`tag: v0.2.0, assets: 2`（dmg + SHA256SUMS）
 
-### 5.2 验证 zip 大小合理
+### 5.2 验证 dmg 大小合理
 
 ```bash
 curl -s "https://api.github.com/repos/nbzz/whicc/releases/tags/$RELEASE_VERSION" \
@@ -205,7 +206,7 @@ for a in d['assets']:
 "
 ```
 
-**期望**：`whicc-v0.2.0.app.zip` ~150-200 MB
+**期望**：`whicc-v0.2.0.dmg` ~150-200 MB（UDZO 压缩后；whicc.app 自身 566 MB 含 Python venv mlx/numpy/scipy）
 
 ### 5.3 验证 SHA256 校验和有效
 
@@ -214,16 +215,36 @@ curl -s "https://api.github.com/repos/nbzz/whicc/releases/tags/$RELEASE_VERSION"
   | python3 -c "
 import json, sys, hashlib, urllib.request
 d = json.load(sys.stdin)
-zip_url = next(a['browser_download_url'] for a in d['assets'] if a['name'].endswith('.zip'))
-zip_bytes = urllib.request.urlopen(zip_url).read()
-actual = hashlib.sha256(zip_bytes).hexdigest()
-print(f'downloaded {len(zip_bytes)/1024/1024:.1f} MB')
-print(f'expected:   {next((a[\"digest\"] for a in d[\"assets\"] if a[\"name\"].endswith(\".zip\")), \"N/A\")}')
+dmg_url = next(a['browser_download_url'] for a in d['assets'] if a['name'].endswith('.dmg'))
+dmg_bytes = urllib.request.urlopen(dmg_url).read()
+actual = hashlib.sha256(dmg_bytes).hexdigest()
+print(f'downloaded {len(dmg_bytes)/1024/1024:.1f} MB')
+print(f'expected:   {next((a[\"digest\"] for a in d[\"assets\"] if a[\"name\"].endswith(\".dmg\")), \"N/A\")}')
 print(f'computed:   sha256:{actual}')
 "
 ```
 
 期望两个 hex 匹配。
+
+### 5.4 本地构建 dmg 验证（可选，但建议）
+
+发布前本地构建一次 dmg 确认 `bin/build_dmg.sh` 工作（特别是改了 `Info.plist` 或 build script 后）：
+
+```bash
+chmod +x bin/build_dmg.sh
+bin/build_dmg.sh 0.1.1   # 不传 version 就从 Info.plist 读
+```
+
+**期望**：`build/dist/whicc-0.1.1.dmg` 生成，大小 ~150-200 MB（UDZO 压缩后）。
+
+**挂载验证**：
+```bash
+open build/dist/whicc-0.1.1.dmg
+# Finder 应弹出，看到 whicc.app + /Applications symlink
+# 拖一次 whicc.app 到 /Applications 试装，再删掉
+```
+
+**为什么 `-size 700m` 而不是更小**：whicc.app 包含完整 Python venv（含 mlx/numpy/scipy 等 ML 库），自身 566 MB。700m 留 ~25% 余量。
 
 ---
 
@@ -263,6 +284,23 @@ print(f'computed:   sha256:{actual}')
 - exit code 65 = xcodebuild 编译错误
 - exit code 1 = preBuildScript 失败（cp venv/ 之类）
 - 错误信息里的 `/Applications/Xcode_16.4.app/...` 表示 xcode-select 没切到 26
+
+### dmg build 失败：`hdiutil: create failed - No space left on device`
+
+**症状**：`Build .dmg` step 报 `ditto: ... : No space left on device`，附 hdiutil 输出 `created: <rw.dmg>` 但写入中断。
+
+**原因**：dmg `-size 700m` 加上 read-write + read-only 中间产物，staging 峰值 +1.4 GB。macos-15 runner ephemeral disk 紧张（其他 step xcodegen + xcodebuild + venv 已用 10-15 GB），或本地 `/tmp` 容量受限。
+
+**修复**：
+1. **改大 `-size`**：如果未来 whicc.app 涨到 > 700MB，调高 `bin/build_dmg.sh` 里的 `-size`
+2. **本地手动指定 TMPDIR**：`TMPDIR=/path/to/big/disk bin/build_dmg.sh 0.1.1`，staging 走大盘
+3. **`df -h` 诊断**：在 release.yml `Build .dmg` step 前一行加 `df -h /`，看 runner 剩余
+
+### dmg build 失败：`hdiutil: create: -format requires -srcfolder or -srcdevice`
+
+**原因**：旧版 `bin/build_dmg.sh` 里在 `hdiutil create -size` 后面加了 `-format UDRW`，但 macOS 14+ 的 hdiutil 在从 -size 创建空白卷时 `-format` 必须跟 `-srcfolder`/`-srcdevice` 配对。
+
+**修复**：从 `hdiutil create` 命令里去掉 `-format UDRW` flag——只创建从 -size 的卷默认就是 UDRW（Apple-recommended staging format）。
 
 ### brew tap warnings（`aws/tap` not trusted）
 
@@ -396,5 +434,5 @@ git push origin <correct-tag>
 
 ---
 
-> Last updated: 2026-07-07, after 6-failure release debugging of v0.1.0.
+> Last updated: 2026-07-07, after 6-failure release debugging of v0.1.0 + v0.1.1 dmg migration.
 > Maintainer: cyberteng <tengzhe@aliyun.com>
