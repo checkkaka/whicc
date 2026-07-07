@@ -191,8 +191,8 @@ struct SubtitleStageView: View, Equatable {
     static func idlePreviewCaption() -> OverlayCaption {
         OverlayCaption(
             id: "idle-preview",
-            sourceText: "Transcribe all languages and Chinese dialects and translate to any language",
-            translatedText: "识别全球语言，翻译成各国语言",
+            sourceText: "@Cyberteng https://github.com/nbzz/whicc Transcribe all languages and Chinese dialects and translate to any language",
+            translatedText: "@Cyberteng https://github.com/nbzz/whicc 识别全球语言，翻译成各国语言",
             mode: "reset_full",
             translateMs: 0
         )
