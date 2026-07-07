@@ -17,15 +17,17 @@ struct SettingsView: View {
         case hermes = "Hermes"
         var id: String { rawValue }
 
-        /// Sidebar 显示标题 — LocalizedStringKey 自动跟随系统 locale:
-        /// en 时查 en.lproj/Localizable.strings,zh 时 fallback 到代码字面量。
-        /// rawValue 仍是 Pane 的稳定 id(NavigationLink value / @State selection 都靠它),
+        /// Sidebar 显示标题 — LocalizedStringKey 自动查表 + 走 i18n fallback:
+        /// - zh 系统 → 查 zh-Hans.lproj (没) → fallback 到代码字面量 (中文)
+        /// - en 系统 → 查 en.lproj (有, 见下面 en.lproj/Localizable.strings
+        ///   "外观" = "Appearance" 等 4 条 key) → 显示英文
+        /// rawValue 仍是 Pane 稳定 id (NavigationLink value + @State selection),
         /// 不要改。
         var localizedTitle: LocalizedStringKey {
             switch self {
-            case .appearance: return "Appearance"
-            case .server:     return "Translation Model"
-            case .model:      return "Speech Recognition Model"
+            case .appearance: return "外观"
+            case .server:     return "翻译模型"
+            case .model:      return "语音识别模型"
             case .hermes:     return "Hermes"
             }
         }

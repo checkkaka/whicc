@@ -5,11 +5,9 @@
  * under en locale without touching call sites. Missing key → fallback to
  * the literal (which IS the Chinese) → zero regression on zh locale.
  *
- * The 5 Pane enum titles use English literal keys (e.g. "Appearance")
- * because we changed `pane.localizedTitle` to return English directly;
- * zh locale will still display the English literal — acceptable for now
- * since zh users see Chinese in Pane *content* (subtitles/cards). Future
- * phase can extend by adding a `localizedTitleZh` mapping.
+ * The 4 Pane enum titles use Chinese literal keys (e.g. "外观") because
+ * pane.localizedTitle returns the Chinese literal; en.lproj translates
+ * them to English. zh locale falls back to the Chinese literal naturally.
  *
  * Window title + menu items use snake_case keys (via NSLocalizedString).
  */
