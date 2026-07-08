@@ -10,6 +10,16 @@ README.md to point at it.
 |---|---|---|---|
 | `icon.png` | Static PNG, 512x512 | ~250 KB | README hero image — the whicc app icon |
 | `demo.mov` | QuickTime H.264 1080p60 | ~13 MB | 38-second live demo video, embedded via `<video>` tag |
+| `subtitle-cn.png` | Static PNG, ~2700×1526 | ~2.5 MB | Chinese source subtitle over English interview (NVIDIA Jensen Huang) |
+| `subtitle-es.png` | Static PNG, ~2700×1526 | ~2.5 MB | Spanish → Chinese translation demo (NVIDIA Jensen Huang) |
+| `subtitle-ja.png` | Static PNG, ~2700×1526 | ~2.3 MB | Japanese → Chinese translation demo (NVIDIA Jensen Huang × interviewer) |
+| `subtitle-bilingual.png` | Static PNG, ~2700×1602 | ~2.3 MB | English → Chinese bilingual subtitle, with YouTube-style playback bar visible |
+| `subtitle-cn-stacked.png` | Static PNG, ~2700×1526 | ~2.2 MB | Stacked multi-segment Chinese subtitle over two-person interview |
+| `subtitle-ar.png` | Static PNG, ~2700×1614 | ~2.0 MB | Arabic → Chinese translation demo (Zhipu CEO interview) |
+
+The 6 `subtitle-*.png` files form a 2-row × 3-column gallery in the root README, showcasing
+whicc across multiple language pairs (zh, en, ja, es, ar). All source videos were foreign-language
+content (no synthesized demo footage).
 
 If you want per-feature screenshots later (e.g. `settings.png`,
 `glossary.png`), follow the `<feature>.png` convention.

@@ -5,7 +5,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS 26+](https://img.shields.io/badge/Platform-macOS%2026%2B-blue.svg)](https://developer.apple.com/macos/)
-[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-black.svg)](https://support.apple.com/en-us/116943)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4%2FM5-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
 [![CI](https://github.com/nbzz/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
@@ -14,6 +14,7 @@
 <!-- 视觉资产 (文件说明见 docs/screenshots/README.md):
      1) docs/screenshots/icon.png   — 顶部 hero image, 应用图标
      2) docs/screenshots/demo.mov   — 38s 演示视频, 用 <video> 标签嵌入
+     3) docs/screenshots/subtitle-*.png — 6 张实际效果截图, 2 行 3 列展示多语种字幕
 -->
 <p align="center">
   <img src="docs/screenshots/icon.png" alt="whicc app icon" width="240">
@@ -21,6 +22,16 @@
 
 <p align="center">
   <video src="docs/screenshots/demo.mov" controls width="720" preload="metadata"></video>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/subtitle-cn.png" width="32%" alt="英伟达黄仁勋访谈的中文字幕" />
+  <img src="docs/screenshots/subtitle-es.png" width="32%" alt="西班牙语翻译成中文" />
+  <img src="docs/screenshots/subtitle-ja.png" width="32%" alt="日语翻译成中文" />
+  <br>
+  <img src="docs/screenshots/subtitle-bilingual.png" width="32%" alt="英中双语字幕，带 YouTube 进度条" />
+  <img src="docs/screenshots/subtitle-cn-stacked.png" width="32%" alt="多段堆叠的中文字幕" />
+  <img src="docs/screenshots/subtitle-ar.png" width="32%" alt="阿拉伯语翻译成中文" />
 </p>
 
 **whicc** = **whi**(sper) + **cc**(closed captions) — 看外语视频时,屏幕上永远挂着一个本地算力撑起来的翻译字幕。
@@ -53,7 +64,7 @@
 | 类型 | 要求 |
 |---|---|
 | OS | **macOS 26+** (MLX wheel 硬绑定 `macosx_26_0_arm64`) |
-| 芯片 | **Apple Silicon** (M1 / M2 / M3 / M4) |
+| 芯片 | **Apple Silicon** (M1 / M2 / M3 / M4 / M5) |
 | 磁盘 | 首次启动设置页下载 ASR 模型,约 **2 GB** |
 | Python | 3.13 (用于源码开发模式,普通用户用 .app 无需) |
 

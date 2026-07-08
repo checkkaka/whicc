@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS 26+](https://img.shields.io/badge/Platform-macOS%2026%2B-blue.svg)](https://developer.apple.com/macos/)
-[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-black.svg)](https://support.apple.com/en-us/116943)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4%2FM5-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
 [![CI](https://github.com/nbzz/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
@@ -13,6 +13,7 @@
 <!-- Visual assets (file description in docs/screenshots/README.md):
      1) docs/screenshots/icon.png   — Top hero image, app icon
      2) docs/screenshots/demo.mov   — 38s demo video, embedded via <video> tag
+     3) docs/screenshots/subtitle-*.png — 6-shot gallery, 2 rows × 3 cols
 -->
 <p align="center">
   <img src="docs/screenshots/icon.png" alt="whicc app icon" width="240">
@@ -20,6 +21,16 @@
 
 <p align="center">
   <video src="docs/screenshots/demo.mov" controls width="720" preload="metadata"></video>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/subtitle-cn.png" width="32%" alt="Chinese subtitle over English interview" />
+  <img src="docs/screenshots/subtitle-es.png" width="32%" alt="Spanish to Chinese translation" />
+  <img src="docs/screenshots/subtitle-ja.png" width="32%" alt="Japanese to Chinese translation" />
+  <br>
+  <img src="docs/screenshots/subtitle-bilingual.png" width="32%" alt="English to Chinese bilingual subtitle" />
+  <img src="docs/screenshots/subtitle-cn-stacked.png" width="32%" alt="Stacked multi-segment Chinese subtitle" />
+  <img src="docs/screenshots/subtitle-ar.png" width="32%" alt="Arabic to Chinese translation" />
 </p>
 
 **whicc** = **whi**(sper) + **cc**(closed captions) — a real-time, locally-powered translation subtitle that always sits on top of any foreign-language video you're watching.
@@ -52,7 +63,7 @@ If you're studying abroad or in a foreign-language class, switch to microphone m
 | Type | Requirement |
 |---|---|
 | OS | **macOS 26+** (MLX wheel hard-binds to `macosx_26_0_arm64`) |
-| Chip | **Apple Silicon** (M1 / M2 / M3 / M4) |
+| Chip | **Apple Silicon** (M1 / M2 / M3 / M4 / M5) |
 | Disk | First-launch model download ≈ **2 GB** |
 | Python | 3.13 (only for source-build development; not needed when using the .app) |
 
