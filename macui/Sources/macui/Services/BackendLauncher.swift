@@ -10,7 +10,14 @@ import Foundation
 ///
 /// 开发模式 (`swift run` 或 `macui/.build/debug/whicc-macui`):不主动
 /// 启动后端 — 用户自己跑 `swift run whicc.py` 等。
-@MainActor
+///
+/// 并发:本类只做文件 IO / Process spawn / 日志轮询,不碰 UI,**不**标
+/// @MainActor — launchBackendsIfNeeded 里的 waitForASRReady 会阻塞
+/// 最长 10s,必须能在后台队列跑(main.swift 的启动链把它丢到
+/// DispatchQueue.global,完成后 hop 回主线程写 pings)。静态可变状态
+/// (_launchStartTime/_pendingPings) 的访问由调用方的串行时序保证:
+/// BG 队列 launchBackendsIfNeeded 写 → main.async appendStartupPings 读,
+/// dispatch 边界自带 happens-before。
 final class BackendLauncher {
     private struct BackendProc {
         let script: String
@@ -21,7 +28,7 @@ final class BackendLauncher {
     /// launchBackendsIfNeeded() 入口记录的启动时戳。appendStartupPings
     /// 用它算"打开 .app → ASR ready"的总耗时。class-level 静态属性 —
     /// 打包模式整个 app 生命周期只会调一次 launchBackendsIfNeeded +
-    /// appendStartupPings,不需要担心 thread safety (整个类 @MainActor)。
+    /// appendStartupPings,访问时序由启动链串行保证(见类注释)。
     private static var _launchStartTime: Date?
 
     /// 启动 4 个后端进程 + 启动计时。**不**直接写 init pings —
@@ -100,7 +107,6 @@ final class BackendLauncher {
                     "--models-dir", modelsDir,
                     "--model", defaultModel,
                     "--language", "auto",
-                    "--mode", "streaming",
                     "--audio-source", "system",
                     "--audio-bin", audioteePath,
                 ],
@@ -256,14 +262,19 @@ final class BackendLauncher {
     }
 
     /// scan 日志等 "模型就绪" 关键词,带超时。返回 ready 时戳或 fallback 时戳。
+    /// 跑在后台队列(调用方保证),阻塞最长 deadline-now。
     private static func waitForASRReady(logPath: String, deadline: Date) -> Date {
         let keywords = ["模型就绪", "启动系统音频"]
         let pollInterval: TimeInterval = 0.1
-        let scanLines = 8  // 只扫文件末尾 N 行,日志可能很大
+        let tailBytes: UInt64 = 4096  // 只读文件尾,不每 0.1s 重读整份日志
         while Date() < deadline {
-            if let content = try? String(contentsOfFile: logPath, encoding: .utf8) {
-                let tail = content.split(separator: "\n").suffix(scanLines).joined(separator: "\n")
-                if keywords.contains(where: tail.contains) {
+            if let fh = FileHandle(forReadingAtPath: logPath) {
+                let size = fh.seekToEndOfFile()
+                fh.seek(toFileOffset: size > tailBytes ? size - tailBytes : 0)
+                let data = fh.readDataToEndOfFile()
+                fh.closeFile()
+                if let tail = String(data: data, encoding: .utf8),
+                   keywords.contains(where: tail.contains) {
                     return Date()
                 }
             }

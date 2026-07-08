@@ -20,6 +20,7 @@ import shutil
 import hashlib
 import threading
 import signal
+import queue as queue_mod
 from collections import Counter
 import numpy as np
 
@@ -286,22 +287,6 @@ def do_transcribe(wav_path: str, language: str = "en",
     return _do_transcribe_nemotron(wav_path, language=language, model_path=model)
 
 
-def do_transcribe_streaming(wav_path: str, language: str = "en",
-                            model: str = DEFAULT_MODEL,
-                            backend: str = "nemotron"):
-    """流式转录生成器。yield (text, is_final)。"""
-    if backend == "qwen3":
-        m = _get_qwen3_model(model)
-        for sr in m.stream_transcribe(wav_path, language=language, verbose=False):
-            text = sr.text.strip() if sr.text else ""
-            if not text:
-                continue
-            yield text, sr.is_final
-    else:
-        # nemotron
-        yield from do_transcribe_streaming_nemotron(wav_path, language=language, model_path=model)
-
-
 def _do_transcribe_qwen3(wav_path: str, language: str = "en", model_path: str = "") -> dict:
     """Qwen3 ASR 转录。"""
     m = _get_qwen3_model(model_path)
@@ -400,27 +385,6 @@ def _do_transcribe_nemotron(wav_path: str, language: str = "en",
             "avg_compression": avg_cr, "no_speech_prob": avg_nsp,
             "sentences": sentences}
 
-
-def do_transcribe_streaming_nemotron(wav_path: str, language: str = "en",
-                                     model_path: str = "",
-                                     att_context: list[int] | None = None):
-    """Nemotron 流式转录生成器。yield (text, is_final)。language='auto' 时自动检测。"""
-    m = _get_nemotron_model(model_path)
-    lang_param = None if language in ("auto", "") else language
-    kwargs = {"language": lang_param}
-    if att_context:
-        kwargs["att_context_size"] = att_context
-    last_text = ""
-    for r in m.stream_generate(wav_path, **kwargs):
-        text = r.text.strip() if r.text else ""
-        if text and text != last_text:
-            last_text = text
-            yield text, False, None
-    # 最终结果用高精度重解码（两遍校正）
-    if last_text:
-        r_final = m.generate(wav_path, language=lang_param, att_context_size=[56, 13])
-        final_text = r_final.text.strip() if r_final.text else last_text
-        yield final_text, True, None
 
 # --------------- 语言检测 ---------------
 
@@ -538,6 +502,34 @@ def read_segments(next_seg: int) -> tuple[list[bytes], int]:
             chunks.append(data)
         next_seg += 1
     return chunks, next_seg
+
+def drain_audio_queue(q: "queue_mod.Queue",
+                      first_timeout: float) -> list[np.ndarray]:
+    """live 模式(system/mic)的读取路径:直接消费 AudioSource.queue。
+
+    阻塞至多 first_timeout 等首个 chunk,拿到后无等待排空当前可用的
+    全部 chunks。chunk 到达即返回(采集回调粒度 ~0.1s),替代旧的
+    SegDirWriter→/tmp 段文件→read_segments 磁盘往返(1s 段聚合 +
+    0.15s 轮询,每段最多 +1.15s 延迟,且 /tmp 被系统清理会断链)。
+
+    SENTINEL(None) = 当前 source 流结束(audio swap 时旧 source 冲刷
+    完毕)——丢弃并停止 drain,下一轮主循环读到的是(swap 后的)新
+    source.queue。
+    """
+    chunks: list[np.ndarray] = []
+    try:
+        first = q.get(timeout=first_timeout)
+        if first is None:
+            return chunks
+        chunks.append(first)
+        while True:
+            nxt = q.get_nowait()
+            if nxt is None:
+                break
+            chunks.append(nxt)
+    except queue_mod.Empty:
+        pass
+    return chunks
 
 # --------------- Event Logger ---------------
 
@@ -715,15 +707,16 @@ def main():
                              "其中的 current_model 覆盖 --model")
     parser.add_argument("--models-dir", default="",
                         help="[BackendLauncher 内部用] 本地模型目录（~/Library/.../whicc/models/）")
-    parser.add_argument("--mode", default="streaming", choices=["streaming", "batch"],
-                        help="ASR 模式：streaming=逐词流式，batch=整段推理（默认 streaming）")
     # 新增：结构化输出
     parser.add_argument("--events-jsonl", metavar="FILE", help="JSONL 事件日志路径")
     parser.add_argument("--output-text", metavar="FILE", help="final-only 输出文件路径")
     parser.add_argument("--audio-bin", default=AUDIO_BIN, help="音频捕获二进制路径（audiotee）")
-    parser.add_argument("--audio-source", default="system", choices=["system", "mic"],
+    parser.add_argument("--audio-source", default="system",
+                        choices=["system", "mic", "segdir"],
                         help="音频源:system=截取系统声音(默认,audiotee),"
-                             "mic=麦克风(sounddevice)")
+                             "mic=麦克风(sounddevice),"
+                             "segdir=轮询 SEG_DIR 段文件(离线评估,"
+                             "由 tools/whicc_file_audio.py 等外部进程投喂)")
     parser.add_argument("--mic-device", default=None,
                         help="麦克风设备索引或名字(传给 sounddevice);默认系统默认")
     parser.add_argument("--dual-model", action="store_true",
@@ -770,14 +763,20 @@ def main():
     resolved_backend = _detect_backend(resolved_model)
     print(f"  后端: {resolved_backend}", flush=True)
 
-    # 音频源：内部多线程采集,不再 fork 外部子进程
-    # (audio.py 里的 AudioSource + SegDirWriter 负责跑采集线程)
-    from audio import make_source, SegDirWriter
-    audio_source = make_source(
-        mode=args.audio_source,
-        audiotee_path=args.audio_bin,
-        mic_device=args.mic_device,
-    )
+    # 音频源:
+    #  - system/mic: 进程内采集线程,主循环直接消费内存 queue(无磁盘往返)
+    #  - segdir:     外部进程写 SEG_DIR 段文件(tools/whicc_file_audio.py
+    #                离线评估),主循环轮询 read_segments() — 文件协议只保留
+    #                在这条评估入口
+    from audio import make_source
+    use_segdir = args.audio_source == "segdir"
+    audio_source = None
+    if not use_segdir:
+        audio_source = make_source(
+            mode=args.audio_source,
+            audiotee_path=args.audio_bin,
+            mic_device=args.mic_device,
+        )
 
     # 初始化日志器（在模型加载前，这样 status 事件能被 overlay 接收）
     logger = EventLogger(args.events_jsonl)
@@ -882,27 +881,26 @@ def main():
     text_out = open(args.output_text, "w", encoding="utf-8") if args.output_text else None
 
     metrics = Metrics(args.stats)
-    cleanup_seg_dir()
 
-    # 启动音频源 + SegDirWriter（audio.py 内部多线程,fork 由 AudioSource
-    # 自己处理——SystemAudioSource 启动 audiotee 子进程,MicSource 用 sounddevice
-    # 回调）。SegDirWriter 维护 SEG_DIR 文件协议,后面 read_segments()
-    # 不需要改一行。
-    try:
-        audio_source.start()
-    except RuntimeError as e:
-        print(f"音频源启动失败: {e}", file=sys.stderr)
-        sys.exit(1)
-    seg_writer = SegDirWriter(audio_source, SEG_DIR)
-    seg_writer.start()
+    # 启动音频源（audio.py 内部多线程,fork 由 AudioSource 自己处理——
+    # SystemAudioSource 启动 audiotee 子进程,MicSource 用 sounddevice
+    # 回调）。主循环直接消费 source.queue 的内存 chunks。
+    # segdir 模式不启动进程内采集,只清空段目录等外部投喂。
+    if use_segdir:
+        cleanup_seg_dir()
+    else:
+        try:
+            audio_source.start()
+        except RuntimeError as e:
+            print(f"音频源启动失败: {e}", file=sys.stderr)
+            sys.exit(1)
     logger.log_status("listening")
 
     # macui HUD ASR chip 点击切 audio source 时发 SIGHUP (pkill -1 -f
     # whicc.py)。handler 重新读 lang_config.json 的 audio_source 键
     # + swap audio_source (停旧 source + 启动新 source + 替换
-    # SegDirWriter 的 source 引用)。SENTINEL 机制保证 SegDirWriter
-    # 旧 source 的残余 chunks 写完才切新 source,read_segments() 端
-    # 协议不变。
+    # audio_source 引用)。SENTINEL 机制保证主循环 drain 完旧 source
+    # 的残余 chunks 后,下一轮自然改读新 source 的 queue。
     #
     # 共享可变状态用 _audio_swap_lock 保护 (SIGHUP handler 在主线程
     # 之外被 Python signal 机制同步调用,但 launch_thread 的启动/停止
@@ -911,18 +909,20 @@ def main():
     _audio_swap_lock = _threading.Lock()
 
     def _swap_audio_source(new_mode: str) -> None:
-        """停掉旧 audio source,启动新 source,替换 SegDirWriter 的 source。
+        """停掉旧 audio source,启动新 source,替换 audio_source 引用。
         失败时 log error 但不崩溃 (whicc.py 继续跑 — 用户改错了能重试)。
         """
         nonlocal audio_source
         with _audio_swap_lock:
+            if audio_source is None:
+                return  # segdir 模式没有进程内 source,不支持热切换
             if new_mode not in ("system", "mic"):
                 logger.log_status(f"unknown audio mode: {new_mode}")
                 return
             try:
                 old_source = audio_source
-                # 旧 source 停 = 它把 SENTINEL 放进自己的 queue,SegDirWriter
-                # 收到后知道这段流结束,继续从新 source 的 queue 读。
+                # 旧 source 停 = 它把 SENTINEL 放进自己的 queue,主循环
+                # drain 到 SENTINEL 就知道这段流结束,换读新 source 的 queue。
                 old_source.stop()
                 # macOS Core Audio process tap: 旧 audiotee 退出后,新
                 # audiotee 启动时 macOS 26 不会重新授权 process tap
@@ -939,26 +939,22 @@ def main():
                     mic_device=args.mic_device,
                 )
                 new_source.start()
-                # 替换 SegDirWriter 的 source 引用,它在另一个线程读 queue,
-                # 替换时 next() 调用会用新 source 的 queue 读 (新 source
-                # 已经 start,enqueue 在新 queue 上)。
-                seg_writer.swap_source(new_source)
+                # 替换 audio_source 引用 — 主循环每轮重新读该变量,
+                # drain 完旧 queue(SENTINEL 收尾)后自然接上新 queue。
                 audio_source = new_source
                 logger.log_status(f"audio source → {new_mode}")
             except Exception as e:
                 # 启动失败,继续用旧 source 跑 (降级)
                 logger.log_status(f"audio swap to {new_mode} failed: {e}")
-                try:
-                    # 把 audio_source 还原成旧 source(如果 new_source.start
-                    # 失败,seg_writer.swap_source 没调用,旧 source 仍可读)
-                    pass
-                except Exception:
-                    pass
+                # new_source.start() 失败时 audio_source 引用未替换,
+                # 主循环继续读旧 source 的 queue(降级,用户可重试)
 
     def _sighup_audio_swap(_signum, _frame) -> None:
         """SIGHUP handler — 读 lang_config.json + swap audio source。
         同步执行 (Python signal handler 限制);swap 内部加锁防重入。
         """
+        if audio_source is None:
+            return  # segdir 模式(离线评估)没有进程内 source,不支持热切换
         try:
             with open("/tmp/whicc-out/lang_config.json", "r", encoding="utf-8") as f:
                 cfg = json.load(f)
@@ -974,7 +970,15 @@ def main():
 
     tmp_wav = os.path.join(tempfile.gettempdir(), f"whicc_chunk_{os.getpid()}.wav")
     overlap_samples = int(SAMPLE_RATE * args.overlap_sec)
-    next_seg = 0
+    next_seg = 0            # segdir 模式的段文件游标
+    samples_ingested = 0    # 已消费样本总数 → 虚拟段号 = // SAMPLE_RATE
+
+    # 探针 ASR 缓存(soft_max/标点断句共享;submit 音频一致时复用免重转)
+    sm_text = None          # 探针转录文本(strip 过)
+    sm_segments = None      # 探针 segments(时间戳,find_audio_split_sec 用)
+    sm_result = None        # 探针完整转录 dict,submit_chunk 复用
+    sm_audio = np.array([], dtype=np.float32)  # 探针时点的音频快照,submit 复用避免后续 collected 增长导致 ASR 多识别尾巴
+    sm_language = "en"      # 默认英文,probe ASR 后会被覆盖
 
     # 自适应 chunk 状态
     collected = []          # list[ndarray]
@@ -1025,7 +1029,8 @@ def main():
 
     def submit_chunk(samples: np.ndarray, seg_start: int, seg_end: int,
                      submit_reason: str, speech_sec: float, trailing_silence_sec: float,
-                     overlap_applied: bool = False):
+                     overlap_applied: bool = False,
+                     precomputed_result: dict | None = None):
         nonlocal confirmed_text, tail_overlap, tail_buffer, resolved_model, resolved_backend, zh_streak, ja_streak, en_streak, pending_switch
 
         chunk_sec = len(samples) / SAMPLE_RATE
@@ -1048,20 +1053,26 @@ def main():
             tail_overlap = save_tail(samples)
             return
 
-        # 阶段 1: PCM 拼接 & WAV 落盘
+        # 阶段 1: PCM 拼接 & WAV 落盘 (复用探针结果时连 WAV 都不用写)
         try:
             t_asm_start = time.monotonic()
             prompt, tail_src, prompt_hash = build_prompt()
-            save_wav(samples, tmp_wav)
+            if precomputed_result is None:
+                save_wav(samples, tmp_wav)
             t_asm_end = time.monotonic()
             asm_ms = (t_asm_end - t_asm_start) * 1000
 
-            # 阶段 2: ASR 推理
+            # 阶段 2: ASR 推理。precomputed_result = 探针对同一段音频
+            # (punct_end 提交的就是探针时点的 sm_audio)已经算好的转录,
+            # 直接复用 — 免掉一次整段重转,推理次数近乎减半。
             t_infer_start = time.monotonic()
-            result = do_transcribe(tmp_wav,
-                                   language=args.language,
-                                   model=resolved_model,
-                                   backend=resolved_backend)
+            if precomputed_result is not None:
+                result = precomputed_result
+            else:
+                result = do_transcribe(tmp_wav,
+                                       language=args.language,
+                                       model=resolved_model,
+                                       backend=resolved_backend)
             t_infer_end = time.monotonic()
             transcribe_ms = (t_infer_end - t_infer_start) * 1000
 
@@ -1255,14 +1266,13 @@ def main():
 
     try:
         while True:
-            # 音频源的崩溃恢复现在由 audio.py 的 SystemAudioSource 内部
-            # supervisor 线程处理（5s stall 自动重启 audiotee）。whicc.py 不
-            # 再 fork 子进程,只关心 SEG_DIR 是不是有数据。SIGINT/SIGTERM
-            # 时 audio_source.stop() 会优雅退出。
+            # 音频源的崩溃恢复由 audio.py 的 SystemAudioSource 内部
+            # supervisor 线程处理（5s stall 自动重启 audiotee）。whicc.py
+            # 只消费数据:live 模式读 source.queue,segdir 模式轮询段文件。
+            # SIGINT/SIGTERM 时 audio_source.stop() 会优雅退出。
             #
-            # 仅在 SEG_DIR 长时间没新文件时给出警告——audio 源自己负责
-            # 重启 a,whicc.py 不需要做。但保留 30s 长 stall 的总超时,
-            # 防止 audio 源自己挂了重启又不成功时,whicc.py 无限循环。
+            # 保留 30s 长 stall 的总超时,防止 audio 源自己挂了重启又
+            # 不成功时,whicc.py 无限循环。
             now = time.monotonic()
             # 收到首段数据后才开始计 30s;启动期静音不退出。
             if last_data_time is not None and now - last_data_time > 30.0:
@@ -1271,33 +1281,46 @@ def main():
                       file=sys.stderr, flush=True)
                 break
 
-            time.sleep(POLL_INTERVAL)
+            # 读取新音频:
+            #  - live(system/mic): 阻塞至多 POLL_INTERVAL 等内存 queue 的
+            #    chunks,到达即处理(采集回调粒度 ~0.1s,无磁盘往返)
+            #  - segdir: 0.15s 轮询 SEG_DIR 段文件(离线评估协议)
+            if use_segdir:
+                time.sleep(POLL_INTERVAL)
+                raw_segs, next_seg = read_segments(next_seg)
+                new_arrays = []
+                for data in raw_segs:
+                    try:
+                        new_arrays.append(
+                            np.frombuffer(data, dtype=np.float32).copy())
+                    except (ValueError, BufferError) as e:
+                        print(f"[warn] 损坏段文件已跳过: {e}",
+                              file=sys.stderr, flush=True)
+            else:
+                new_arrays = drain_audio_queue(audio_source.queue,
+                                               POLL_INTERVAL)
 
-            # 读取新段文件
-            new_chunks, next_seg = read_segments(next_seg)
-            if not new_chunks:
+            if not new_arrays:
                 continue
             last_data_time = time.monotonic()  # 收到新数据，重置卡死计时器
 
-            # 逐段处理，精确维护 chunk 边界
+            # 逐 chunk 处理，精确维护 chunk 边界
             # 软最大值剩余音频：作为当前 chunk 的起始部分（不设 overlap，它是直接延续）
             if len(soft_max_remainder) > 0:
                 collected.insert(0, soft_max_remainder)
                 collected_count += len(soft_max_remainder)
                 soft_max_remainder = np.array([], dtype=np.float32)
 
-            new_seg_count = 0
-            for seg_idx, data in enumerate(new_chunks, start=next_seg - len(new_chunks)):
-                try:
-                    samples = np.frombuffer(data, dtype=np.float32).copy()
-                except (ValueError, BufferError) as e:
-                    print(f"[warn] 损坏段文件已跳过: {e}", file=sys.stderr, flush=True)
-                    continue
-
+            batch_started = False
+            for samples in new_arrays:
+                # 虚拟段号 = 已消费整秒数(1 段 ≡ 1 秒),与旧文件段号语义一致
+                # — translate_stream._source_key 和日志对齐依赖 seg_start/
+                # seg_end。segdir 模式每段恰 1s,虚拟号等于文件段号。
                 # 新 chunk 起始段号（仅在 collected 为空时更新，remainder 不影响）
-                if not collected and new_seg_count == 0:
-                    chunk_first_seg = seg_idx
-                new_seg_count += 1
+                if not collected and not batch_started:
+                    chunk_first_seg = samples_ingested // SAMPLE_RATE
+                batch_started = True
+                samples_ingested += len(samples)
 
                 collected.append(samples)
                 collected_count += len(samples)
@@ -1314,22 +1337,15 @@ def main():
                     silence_streak += len(samples) / SAMPLE_RATE
 
             chunk_sec = collected_count / SAMPLE_RATE
-            seg_end = chunk_first_seg + new_seg_count  # 用实际新段数，remainder 不影响
+            seg_end = samples_ingested // SAMPLE_RATE  # 当前虚拟段号(累计秒)
 
             # ---- 探针 ASR: 累积够 MIN_CHUNK_SEC (2s) 就跑,持续刷新 sm_text ----
             # 触发器 (punct_end) 看 sm_text 是否包含完整句末标点 — 当前 ASR 看到的
             # 真实文本,而不是"上一段 final 的标点"。这样能避免切半句话。
             # 软最大值切割在下面单独判断,共用 sm_text 缓存不重复跑推理。
-            if 'sm_text' not in dir():
-                sm_text = None
-                sm_segments = None
-                sm_chunk_sec = 0.0
-                sm_audio = np.array([], dtype=np.float32)  # 探针时点的音频快照,submit 复用避免后续 collected 增长导致 ASR 多识别尾巴
-                sm_language = "en"  # 默认英文,probe ASR 后会被覆盖
             if chunk_sec >= MIN_CHUNK_SEC and has_speech:
                 need_asr = sm_text is None or (time.monotonic() - soft_max_last_asr) >= SOFT_MAX_ASR_COOLDOWN
                 if need_asr:
-                    t0 = time.monotonic()
                     all_sm = np.concatenate(collected)
                     sm_audio = all_sm.copy()
                     tmp_sm = os.path.join(tempfile.gettempdir(), f"whicc_soft_{os.getpid()}.wav")
@@ -1341,6 +1357,7 @@ def main():
                                                   backend=resolved_backend)
                         sm_text = result_sm.get("text", "").strip()
                         sm_segments = result_sm.get("segments")
+                        sm_result = result_sm  # 完整 dict,submit 音频一致时复用
                         # ASR 返回的 language (e.g. "zh" / "en") 用于分语言阈值
                         sm_language = result_sm.get("language", "en") or "en"
                         # Nemotron 返回 "zh" / "en" / "zh-CN" 等,Qwen3 返回 ["zh"] 列表
@@ -1348,15 +1365,15 @@ def main():
                             sm_language = sm_language[0] if sm_language else "en"
                         # 规范化: "zh-CN" / "zh-Hans" → "zh"
                         sm_language = sm_language.split("-")[0].lower()
-                        sm_chunk_sec = chunk_sec
-                        sm_ms = (time.monotonic() - t0) * 1000
                         soft_max_last_asr = time.monotonic()
                         if not sm_text:
                             sm_text = None
+                            sm_result = None
                             sm_audio = np.array([], dtype=np.float32)
                     except Exception as e:
                         print(f"[probe-asr] ASR 异常: {e}", file=sys.stderr, flush=True)
                         sm_text = None
+                        sm_result = None
                         sm_audio = np.array([], dtype=np.float32)
                     finally:
                         try:
@@ -1375,7 +1392,7 @@ def main():
             #
             # 分语言阈值 (PUNCT_END_MIN_CHUNK_SEC_EN=3 / _ZH=5),中文需要更多上下文。
             # 字符数校验 (MIN_CHARS_BEFORE_PUNCT_*): 中文 12 字以上,英文 8 字以上。
-            _cur_lang = sm_language if 'sm_language' in dir() else "en"
+            _cur_lang = sm_language
             _min_chunk_for_punct = PUNCT_END_MIN_CHUNK_SEC_ZH if _cur_lang.startswith("zh") else PUNCT_END_MIN_CHUNK_SEC_EN
             _min_chars_before_punct = MIN_CHARS_BEFORE_PUNCT_ZH if _cur_lang.startswith("zh") else MIN_CHARS_BEFORE_PUNCT_EN
             _stripped_sm = sm_text.rstrip() if sm_text else ""
@@ -1409,6 +1426,7 @@ def main():
                     speech_accumulated = 0
                     soft_max_last_asr = 0.0
                     sm_text = None
+                    sm_result = None
                     sm_audio = np.array([], dtype=np.float32)
                     should_submit = False
                     should_discard = False
@@ -1458,6 +1476,7 @@ def main():
                     speech_accumulated = 0
                     soft_max_last_asr = 0.0
                     sm_text = None
+                    sm_result = None
                     sm_audio = np.array([], dtype=np.float32)
                     should_submit = False
                     should_discard = False
@@ -1483,7 +1502,7 @@ def main():
             #   probe ASR 用的是当前 chunk 音频,submit 不加 overlap 就跟 probe 看到的音频范围一致。
             punct_end_submit = False
             # 根据语言选阈值
-            _cur_lang = sm_language if 'sm_language' in dir() else "en"
+            _cur_lang = sm_language
             _min_chunk_for_punct = PUNCT_END_MIN_CHUNK_SEC_ZH if _cur_lang.startswith("zh") else PUNCT_END_MIN_CHUNK_SEC_EN
             _min_chars_before_punct = MIN_CHARS_BEFORE_PUNCT_ZH if _cur_lang.startswith("zh") else MIN_CHARS_BEFORE_PUNCT_EN
             if (has_speech and chunk_sec >= _min_chunk_for_punct and sm_text
@@ -1510,17 +1529,24 @@ def main():
                 # punct_end 路径: 用探针时点的 sm_audio (跟 probe ASR 完全相同的音频),
                 # 而不是当前 collected (collected 累积到 submit 时多了 0.3s,
                 # ASR 会多识别出 "...right? People are" 这种 mid-sentence 尾巴)
+                # 提交音频与探针一致时把探针转录一并传下去,submit_chunk 免重转。
                 if punct_end_submit and len(sm_audio) > 0:
                     all_samples = sm_audio
                     overlap_applied = False
+                    reuse_result = sm_result
                 else:
                     all_samples = np.concatenate(collected) if collected else np.array([], dtype=np.float32)
+                    reuse_result = None
                     if punct_end_submit:
                         overlap_applied = False
                     else:
                         overlap_applied = len(tail_overlap) > 0 and len(all_samples) > 0
                         if overlap_applied:
                             all_samples = np.concatenate([tail_overlap, all_samples])
+                        elif sm_result is not None and len(sm_audio) == len(all_samples):
+                            # silence/max_chunk 提交的音频与探针时点完全一致
+                            # (collected 只尾部 append,等长 ⇒ 同一段) → 复用
+                            reuse_result = sm_result
                 cur_speech = speech_accumulated
                 cur_trailing = silence_streak
                 collected = []
@@ -1529,12 +1555,14 @@ def main():
                 silence_streak = 0
                 speech_accumulated = 0
                 sm_text = None
+                sm_result = None
                 sm_audio = np.array([], dtype=np.float32)
                 submit_chunk(all_samples, chunk_first_seg, seg_end,
                              submit_reason=submit_reason,
                              speech_sec=cur_speech,
                              trailing_silence_sec=cur_trailing,
-                             overlap_applied=overlap_applied)
+                             overlap_applied=overlap_applied,
+                             precomputed_result=reuse_result)
 
             elif should_discard:
                 # 纯静音，丢弃但保留尾部 overlap
@@ -1554,15 +1582,15 @@ def main():
         logger.close()
         if text_out:
             text_out.close()
-        # 关闭音频源——SegDirWriter 线程读到 SENTINEL 后会 flush 残留 buf,
-        # AudioSource.stop() 会把 audiotee 子进程 / sounddevice stream 收掉。
-        try:
-            audio_source.stop()
-        except Exception as e:  # noqa: BLE001
-            print(f"[audio] stop() 异常: {e}", file=sys.stderr)
-        if seg_writer is not None:
-            seg_writer.stop()
-        cleanup_seg_dir()
+        # 关闭音频源——AudioSource.stop() 会把 audiotee 子进程 /
+        # sounddevice stream 收掉。
+        if audio_source is not None:
+            try:
+                audio_source.stop()
+            except Exception as e:  # noqa: BLE001
+                print(f"[audio] stop() 异常: {e}", file=sys.stderr)
+        if use_segdir:
+            cleanup_seg_dir()
 
 if __name__ == "__main__":
     main()

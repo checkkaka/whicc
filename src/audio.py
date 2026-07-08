@@ -2,16 +2,17 @@
 
 Both sources behave the same way: capture in the background, push float32 [-1, 1]
 mono chunks into self.queue, and put a SENTINEL(None) when the stream ends. The
-downstream ASR thread consumes via queue.get().
+downstream ASR loop (whicc.py) consumes via queue.get() directly — in-memory,
+no disk round-trip.
 
 设计参考 livecaption (six-ddc/livecaption) 的 audio.py——单一 Python 进程
 内部多线程,音频采集跟 ASR 通过内存 queue.Queue 解耦,不再依赖外部 Swift 二进制
 长期驻守。
 
-为什么重构：之前用 /tmp/whicc-audio/.build/debug/whicc-audio 跟 SEG_DIR 文件协议
-会让 /tmp 被系统清理时整个 ASR 链断掉。换成这里:whicc.py 内部同时跑一个
-SegDirWriter 线程把 audio.queue 的 float32 chunks 写到 SEG_DIR 文件,SEG_DIR
-成为纯缓存(win 边界 case 时保留最新段文件),不依赖外部进程维持。
+历史:早期版本经 SegDirWriter 把 queue 数据写成 /tmp/whicc-seg 段文件,再由
+主循环轮询读回(0.15s 轮询 + 1s 段聚合的额外延迟,且 /tmp 被系统清理会断链)。
+现在 live 模式(system/mic)主循环直接消费 source.queue;SEG_DIR 文件协议仅保留
+为 whicc.py --audio-source segdir 的离线评估入口(tools/whicc_file_audio.py 投喂)。
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
-from config import SAMPLE_RATE, SYSTEM_AUDIO_STALL_SEC, SEG_BYTES
+from config import SAMPLE_RATE, SYSTEM_AUDIO_STALL_SEC
 
 SENTINEL = None  # putting this on the queue signals the audio stream has ended
 
@@ -350,127 +351,6 @@ class SystemAudioSource(AudioSource):
         print(f"[audio] SystemAudioSource stopped (audiotee kept alive)",
               flush=True)
 
-
-
-class SegDirWriter:
-    """把 AudioSource.queue 的 float32 chunks 写到 SEG_DIR 文件,保持 whicc.py
-    现有的 read_segments() 协议不动。
-
-    audio 线程 = AudioSource 自己的后台线程,本类是单独线程,负责:
-    - 从 source.queue.get() 读 chunks
-    - 累计 1 秒的 float32 mono 数据
-    - 写到 SEG_DIR/seg-NNNNNN.pcm (64000 字节 = 16000 samples * 4 字节 float32)
-    - audio 流结束时 flush 最后一个不满 1s 的 chunk(写 SEG_BYTES 截断)
-
-    跟老 whicc-audio / whicc_mic.py SEG_DIR 协议 100% 兼容,
-    所以 whicc.py 里 read_segments() 不需要改一行。
-    """
-
-    def __init__(self, source: AudioSource, seg_dir: str):
-        self.source = source
-        self.seg_dir = seg_dir
-        self._seg_idx = 0
-        self._buf = bytearray()
-        self._thread: threading.Thread | None = None
-        self._bytes_written = 0
-
-    def start(self) -> None:
-        os.makedirs(self.seg_dir, exist_ok=True)
-        # 启动前清空 SEG_DIR(等价于 cleanup_seg_dir)
-        for f in os.listdir(self.seg_dir):
-            if f.endswith(".pcm"):
-                with contextlib.suppress(OSError):
-                    os.unlink(os.path.join(self.seg_dir, f))
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name=f"seg-writer-{self.source.label}"
-        )
-        self._thread.start()
-        print(f"[audio] SegDirWriter started: {self.seg_dir}", flush=True)
-
-    def swap_source(self, new_source: "AudioSource") -> None:
-        """热切换 audio source。
-
-        caller 流程:
-          1. old_source.stop()  → 它把 SENTINEL 放进旧 queue
-          2. swap_source(new)    → 替换 self.source 引用,重启 _run
-          3. new_source.start()   → 它开始往新 queue enqueue
-
-        关键时序: swap_source 内必须把旧 _run 完整退出再启新 _run,
-        否则两个 _run 同时从 new_source.queue.get() 会 data race (read
-        一次只能被一个线程消费,SENTINEL 后只剩 new_source 的正常 chunks,
-        但两个 thread 都想读,一个会拿到数据,另一个拿 None/EOF)。
-        """
-        # 0. 等旧 _run 干净退出 (旧 source 已 stop,旧 queue 的 SENTINEL
-        #    已塞,_run 收到 SENTINEL 后 flush + break,join() 等到)
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            # join 超时 = 旧 _run 没退出。可能 SENTINEL 没到,或旧 source
-            # queue 有其他阻塞。安全起见:不替换,让 caller 知道失败。
-            if self._thread.is_alive():
-                print(f"[audio] SegDirWriter.swap_source: WARNING old _run "
-                      f"thread still alive after 5s, refusing swap",
-                      flush=True)
-                return
-        # 1. 替换 source + 清 buffer (从新 source 的 0 开始写)。
-        # **不要**重置 _seg_idx — whicc.py 的 read_segments 用递增序号
-        # 找文件,reset 后新文件从 seg-000000 开始,但 whicc 还在找
-        # 旧位置(100+)。whicc 永远找不到新文件 → 30s stall 杀 whicc。
-        # 正确做法: 跨 swap 连续编号,让 whicc.read_segments 自然接上。
-        self.source = new_source
-        self._buf = bytearray()
-        # 2. 启新 _run 线程,读新 source 的 queue
-        self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name=f"seg-writer-{new_source.label}",
-        )
-        self._thread.start()
-        print(f"[audio] SegDirWriter.swap_source: started new _run "
-              f"(source={new_source.label})", flush=True)
-
-    def _run(self) -> None:
-        print(f"[audio] _run start (source={self.source.label})", flush=True)
-        try:
-            segs_written = 0
-            while True:
-                chunk = self.source.queue.get()
-                if chunk is None:  # SENTINEL
-                    self._flush()
-                    print(f"[audio] _run got SENTINEL (source={self.source.label}, "
-                          f"segs_written={segs_written})", flush=True)
-                    break
-                # chunk = 1d ndarray float32 mono
-                self._buf.extend(chunk.astype("<f4").tobytes())
-                # 累计满 1 秒(SEG_BYTES)就写一个文件
-                while len(self._buf) >= SEG_BYTES:
-                    seg_bytes = bytes(self._buf[:SEG_BYTES])
-                    self._write_seg(seg_bytes)
-                    segs_written += 1
-                    if segs_written <= 3 or segs_written % 5 == 0:
-                        print(f"[audio] _run wrote seg-{self._seg_idx-1:06d} "
-                              f"(source={self.source.label})", flush=True)
-                    del self._buf[:SEG_BYTES]
-        except Exception as e:  # noqa: BLE001
-            print(f"\n[error] SegDirWriter crashed: {e}", file=sys.stderr, flush=True)
-            import traceback
-            traceback.print_exc()
-
-    def _write_seg(self, data: bytes) -> None:
-        path = os.path.join(self.seg_dir, f"seg-{self._seg_idx:06d}.pcm")
-        with open(path, "wb") as f:
-            f.write(data)
-        self._bytes_written += len(data)
-        self._seg_idx += 1
-
-    def _flush(self) -> None:
-        """流结束时 flush 残留 buffer(不补零到 SEG_BYTES,保持最后一帧实际长度)。"""
-        if self._buf:
-            self._write_seg(bytes(self._buf))
-            self._buf.clear()
-
-    def stop(self) -> None:
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
 
 
 def make_source(mode: str, audiotee_path: str | None = None,

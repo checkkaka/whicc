@@ -659,7 +659,7 @@ def _load_state(path: str) -> dict:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"byte_offset": 0, "processed_keys": [], "failed_keys": []}
+        return {"byte_offset": 0}
 
 
 def _save_state(path: str, state: dict):
@@ -840,33 +840,28 @@ def main():
         # CLI fallback (外部脚本可能传) 用配置的 fb model — 也算"本机"
         model_map[cli_fb] = fb_model_id
 
-    # 探活一次让用户立刻看到状态;失败就退出 — 比让进程空转报错更友好
+    # __init__ 内部就做健康探活,失败抛异常 — 建一次直接用,失败就退出
+    # (比让进程空转报错更友好;早期版本先建一个丢弃的实例探活,再建正式的,
+    # 启动时白跑两次 GET /v1/models,已合并)。
     try:
-        HyMT2Translator(vllm_url=candidates, model_id=model_id,
-                        model_map=model_map,
-                        glossary_path=args.glossary,
-                        max_new_tokens=args.max_new_tokens)
+        translator = HyMT2Translator(
+            model_id=model_id,
+            vllm_url=candidates,
+            model_map=model_map,
+            glossary_path=args.glossary,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
+            max_new_tokens=args.max_new_tokens,
+        )
         print(f"[translate] 已连接翻译服务,候选: {candidates}", flush=True)
     except Exception as e:
         print(f"[translate] 所有候选翻译节点都不可达: {e}", flush=True)
         sys.exit(1)
 
-    translator = HyMT2Translator(
-        model_id=model_id,
-        vllm_url=candidates,
-        model_map=model_map,
-        glossary_path=args.glossary,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        repetition_penalty=args.repetition_penalty,
-        max_new_tokens=args.max_new_tokens,
-    )
-
     state = _load_state(state_path)
     byte_offset = state.get("byte_offset", 0)
-    processed_keys: set[str] = set(state.get("processed_keys", []))
-    failed_keys: set[str] = set(state.get("failed_keys", []))
     pending_partial_line = state.get("pending_partial_line", "")
 
     f_trans = open(trans_events_path, "a", encoding="utf-8")
@@ -905,10 +900,11 @@ def main():
         print("[translate] 同声传译模式（增量翻译 + 异步线程）", flush=True)
 
     def _flush_state():
+        # 注: 早期版本还持久化 processed_keys/failed_keys 两个集合,但去重
+        # 逻辑已改走 partial_cache,它们只增不读、每次全量序列化 — 长会话
+        # 内存与磁盘 IO 无限上涨,已删除。旧 state 文件里的多余键被忽略。
         _save_state(state_path, {
             "byte_offset": byte_offset,
-            "processed_keys": list(processed_keys),
-            "failed_keys": list(failed_keys),
             "pending_partial_line": pending_partial_line,
         })
 
@@ -933,8 +929,6 @@ def main():
             f_bi.flush()
 
     print(f"[translate] 开始消费 {args.events} (offset={byte_offset})", flush=True)
-    if processed_keys:
-        print(f"[translate] 已处理 {len(processed_keys)} 条，跳过", flush=True)
 
     # ── 词库热加载 ──
     _glossary_path = args.glossary
@@ -1123,7 +1117,7 @@ def main():
                       f"resetting offset", flush=True)
                 byte_offset = 0
                 # 也清空 saved state 里的旧 offset,持久层也跟上
-                _save_state(processed_keys=None, failed_keys=None)
+                _flush_state()
             elif fsize == byte_offset:
                 if args.once:
                     break
@@ -1177,13 +1171,11 @@ def main():
 
                 source_text = event.get("text", "").strip()
                 if not source_text:
-                    processed_keys.add(key)
                     continue
 
                 if is_partial_mode and worker is not None:
                     # 异步：dispatch 给 worker，worker 内部做 classify + translate
                     worker.dispatch_final(event, source_text, key)
-                    processed_keys.add(key)
                 else:
                     # 同步：主线程做 classify + translate + write
                     update_info = trans_state.classify(source_text)
@@ -1191,15 +1183,12 @@ def main():
                         translator, source_text, update_info, event, counts,
                     )
                     if out_event and out_event.get("event_type") == "translation_error":
-                        failed_keys.add(key)
                         with out_lock:
                             f_trans.write(json.dumps(out_event, ensure_ascii=False) + "\n")
                             f_trans.flush()
                         _flush_state()
                         continue
                     _write_output(event, out_event)
-                    processed_keys.add(key)
-                    failed_keys.discard(key)
 
             byte_offset = new_byte_offset
             _flush_state()
