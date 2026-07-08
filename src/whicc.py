@@ -782,6 +782,31 @@ def main():
     logger = EventLogger(args.events_jsonl)
     logger.log_status("loading_model")
 
+    # ── 启动加速: 音频采集先行 ──
+    # 采集在模型加载/warmup(共 3-5s)期间并行进行,音频进 source.queue
+    # 积累(容量 ~20s,远大于加载时长)。主循环开始时已有存量音频可
+    # 处理 → 首条字幕出现时间提前 ≈ 整个模型加载时长。
+    # 之前的顺序是 加载模型 → warmup → 启动采集,用户开 app 后说的
+    # 前几秒话全部丢失。
+    # status 事件序列(loading_model → ready → listening)保持不变,
+    # macui 的 banner 逻辑无感知。
+    if not use_segdir:
+        try:
+            audio_source.start()
+        except RuntimeError as e:
+            print(f"音频源启动失败: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def _exit_with_audio_cleanup(code: int):
+        """模型加载失败退出前把已启动的采集收干净
+        (audiotee 子进程 / sounddevice stream)。"""
+        if audio_source is not None:
+            try:
+                audio_source.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        sys.exit(code)
+
     #   whicc.py 不应该 crash 整个进程。fallback 路径:
     #   qwen3 加载失败 → 切 nemotron 默认 (本地路径优先)
     #   nemotron 加载失败 → 强制走本地路径,跳过 HF download
@@ -825,7 +850,7 @@ def main():
                 logger.log_status(str(e2))
                 # 不 raise — 让 whicc.py 干净退出留下 log 痕迹,
                 # macui 能读到 model_load_failed status 提示用户。
-                sys.exit(1)
+                _exit_with_audio_cleanup(1)
         else:
             # 本地也没下载 nemotron → 让用户去 macui 下载
             print(f"[model-load] 本地 nemotron 不存在: {local_nemotron}",
@@ -834,7 +859,7 @@ def main():
                   file=sys.stderr, flush=True)
             logger.log_status("model_load_failed")
             logger.log_status(f"local nemotron not found at {local_nemotron}")
-            sys.exit(1)
+            _exit_with_audio_cleanup(1)
 
     if fallback_used:
         print(f"[model-load] fallback 成功,继续运行", flush=True)
@@ -875,6 +900,9 @@ def main():
     except OSError:
         pass
 
+    # 注:BackendLauncher.waitForASRReady 扫日志找"模型就绪"关键词,
+    # 这行文案不要改。音频采集已在模型加载前启动(启动加速),这里
+    # 只是宣告主循环即将开始消费。
     print("模型就绪。启动系统音频捕获...\n", flush=True)
     logger.log_status("ready")
 
@@ -882,18 +910,10 @@ def main():
 
     metrics = Metrics(args.stats)
 
-    # 启动音频源（audio.py 内部多线程,fork 由 AudioSource 自己处理——
-    # SystemAudioSource 启动 audiotee 子进程,MicSource 用 sounddevice
-    # 回调）。主循环直接消费 source.queue 的内存 chunks。
-    # segdir 模式不启动进程内采集,只清空段目录等外部投喂。
+    # segdir 模式(离线评估)无进程内采集,清空段目录等外部投喂;
+    # live 模式的 audio_source.start() 已提前到模型加载之前。
     if use_segdir:
         cleanup_seg_dir()
-    else:
-        try:
-            audio_source.start()
-        except RuntimeError as e:
-            print(f"音频源启动失败: {e}", file=sys.stderr)
-            sys.exit(1)
     logger.log_status("listening")
 
     # macui HUD ASR chip 点击切 audio source 时发 SIGHUP (pkill -1 -f
