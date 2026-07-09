@@ -380,24 +380,54 @@ class TranslateWorker:
 
     def _run(self):
         processed = 0
-        while True:
+        stopping = False
+        while not stopping:
             try:
                 item = self._queue.get(timeout=0.5)
             except Empty:
                 continue
             if item is None:
                 break
-            mode, event, source_text, key = item
-            try:
-                if mode == "partial":
-                    self._do_partial(event, source_text, key)
-                else:
-                    out_event = self._do_final(event, source_text, key)
-                    self._write_final_output(out_event, event)
-                processed += 1
-            except Exception as exc:
-                print(f"\n[warn] worker error ({processed} done): {exc}", flush=True)
-                import traceback; traceback.print_exc()
+            # ── 积压合并:把队列里已到的任务一次性取出,过期 partial 丢弃 ──
+            # 单线程 worker + 每个请求秒级网络延迟,ASR partial(~0.6s 一个)
+            # 必然产出快于消费 — 不丢弃的话队列越积越深,用户看到的字幕
+            # 是几十秒前的内容("翻译非常卡顿"的直接原因)。规则:
+            #  - final 全保留(要写文件/进字幕历史),按到达顺序处理;
+            #  - partial 是 draft,同 key 只有最新一条有意义;该 key 已有
+            #    final 在队里的,partial 直接丢(final 马上覆盖它)。
+            batch = [item]
+            while True:
+                try:
+                    nxt = self._queue.get_nowait()
+                except Empty:
+                    break
+                if nxt is None:
+                    stopping = True  # 处理完本批再退,final 不丢
+                    break
+                batch.append(nxt)
+            finals = [it for it in batch if it[0] == "final"]
+            final_keys = {it[3] for it in finals}
+            latest_partial: dict[str, tuple] = {}
+            for it in batch:
+                if it[0] == "partial" and it[3] not in final_keys:
+                    latest_partial[it[3]] = it  # 后到覆盖先到 → 只留最新
+            dropped = len(batch) - len(finals) - len(latest_partial)
+            if dropped > 0:
+                print(f"[translate] 队列积压,丢弃 {dropped} 条过期 partial",
+                      flush=True)
+            for mode, event, source_text, key in \
+                    finals + list(latest_partial.values()):
+                try:
+                    if mode == "partial":
+                        self._do_partial(event, source_text, key)
+                    else:
+                        out_event = self._do_final(event, source_text, key)
+                        self._write_final_output(out_event, event)
+                    processed += 1
+                except Exception as exc:
+                    print(f"\n[warn] worker error ({processed} done): {exc}",
+                          flush=True)
+                    import traceback; traceback.print_exc()
         print(f"[translate] worker exiting after {processed} items", flush=True)
 
     def _do_partial(self, event, source_text, key):
