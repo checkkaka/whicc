@@ -380,24 +380,54 @@ class TranslateWorker:
 
     def _run(self):
         processed = 0
-        while True:
+        stopping = False
+        while not stopping:
             try:
                 item = self._queue.get(timeout=0.5)
             except Empty:
                 continue
             if item is None:
                 break
-            mode, event, source_text, key = item
-            try:
-                if mode == "partial":
-                    self._do_partial(event, source_text, key)
-                else:
-                    out_event = self._do_final(event, source_text, key)
-                    self._write_final_output(out_event, event)
-                processed += 1
-            except Exception as exc:
-                print(f"\n[warn] worker error ({processed} done): {exc}", flush=True)
-                import traceback; traceback.print_exc()
+            # ── 积压合并:把队列里已到的任务一次性取出,过期 partial 丢弃 ──
+            # 单线程 worker + 每个请求秒级网络延迟,ASR partial(~0.6s 一个)
+            # 必然产出快于消费 — 不丢弃的话队列越积越深,用户看到的字幕
+            # 是几十秒前的内容("翻译非常卡顿"的直接原因)。规则:
+            #  - final 全保留(要写文件/进字幕历史),按到达顺序处理;
+            #  - partial 是 draft,同 key 只有最新一条有意义;该 key 已有
+            #    final 在队里的,partial 直接丢(final 马上覆盖它)。
+            batch = [item]
+            while True:
+                try:
+                    nxt = self._queue.get_nowait()
+                except Empty:
+                    break
+                if nxt is None:
+                    stopping = True  # 处理完本批再退,final 不丢
+                    break
+                batch.append(nxt)
+            finals = [it for it in batch if it[0] == "final"]
+            final_keys = {it[3] for it in finals}
+            latest_partial: dict[str, tuple] = {}
+            for it in batch:
+                if it[0] == "partial" and it[3] not in final_keys:
+                    latest_partial[it[3]] = it  # 后到覆盖先到 → 只留最新
+            dropped = len(batch) - len(finals) - len(latest_partial)
+            if dropped > 0:
+                print(f"[translate] 队列积压,丢弃 {dropped} 条过期 partial",
+                      flush=True)
+            for mode, event, source_text, key in \
+                    finals + list(latest_partial.values()):
+                try:
+                    if mode == "partial":
+                        self._do_partial(event, source_text, key)
+                    else:
+                        out_event = self._do_final(event, source_text, key)
+                        self._write_final_output(out_event, event)
+                    processed += 1
+                except Exception as exc:
+                    print(f"\n[warn] worker error ({processed} done): {exc}",
+                          flush=True)
+                    import traceback; traceback.print_exc()
         print(f"[translate] worker exiting after {processed} items", flush=True)
 
     def _do_partial(self, event, source_text, key):
@@ -911,6 +941,27 @@ def main():
     f_zh = open(zh_txt_path, "a", encoding="utf-8")
     f_bi = open(bilingual_path, "a", encoding="utf-8")
 
+    if translator is None:
+        # 一次性告知 UI 进入"仅原文"模式 — 正式字幕走上面的原文透传,
+        # 但用户得知道译文为什么没了(走 translation_final 通道,跟
+        # BackendLauncher.appendBackendNotice 同款形态)。
+        _notice = {
+            "event_type": "translation_final",
+            "source_key": f"notice-{int(time.time() * 1000)}",
+            "source_update_mode": "reset_full",
+            "source_text": "Translation service unreachable — captions show "
+                           "source only; auto-recovers once reachable",
+            "translated_full_text": "⚠️ 翻译服务不可达,字幕暂只显示原文;"
+                                    "连上后自动恢复(设置 → 服务配置 可检查地址)",
+            "translate_ms": 0,
+            "shared_prefix_len": 0,
+            "glossary_hits": [],
+            "retried": False,
+            "fallback_reason": "",
+        }
+        f_trans.write(json.dumps(_notice, ensure_ascii=False) + "\n")
+        f_trans.flush()
+
     counts = {"translated": 0, "errors": 0, "deltas": 0, "fallbacks": 0}
     is_partial_mode = args.mode == "partial"
     out_lock = threading.Lock()
@@ -1220,10 +1271,36 @@ def main():
 
                 etype = event.get("event_type")
 
-                # 等待模式:服务不可达期间跳过事件(offset 照常推进,不
-                # 积压 — 实时字幕翻旧内容没有意义),字幕区继续显示
-                # ASR 原文 draft。
+                # 等待模式:服务不可达期间不翻译(offset 照常推进,不
+                # 积压 — 实时字幕翻旧内容没有意义),但 ASR final 必须
+                # **原文透传** — UI 正式字幕的唯一 commit 通道是
+                # translation_final(OverlayState.applyFinal),之前这里
+                # 直接 continue,以为"字幕区还有 ASR 原文 draft"顶着,
+                # 实际 final 一发 draft 就走清理链,翻译节点不可达时
+                # 用户一个字都看不到。译文发空串:SubtitleCaption 对空
+                # 译文只渲染原文行,连上后自动恢复双语。
                 if translator is None:
+                    if etype == "final" and event.get("accepted", False):
+                        src_text = event.get("text", "").strip()
+                        if src_text:
+                            passthrough = {
+                                "event_type": "translation_final",
+                                "source_key": _source_key(event),
+                                "source_update_mode": "no_translator_passthrough",
+                                "source_text": src_text,
+                                "delta_source_text": src_text,
+                                "translated_delta_text": "",
+                                "translated_full_text": "",
+                                "translate_ms": 0,
+                                "shared_prefix_len": 0,
+                                "glossary_hits": [],
+                                "retried": False,
+                                "fallback_reason": "translator_unavailable",
+                            }
+                            with out_lock:
+                                f_trans.write(json.dumps(
+                                    passthrough, ensure_ascii=False) + "\n")
+                                f_trans.flush()
                     continue
 
                 # ── partial 事件（partial 模式，异步翻译 + 显示）──

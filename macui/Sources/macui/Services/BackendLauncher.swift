@@ -33,7 +33,8 @@ final class BackendLauncher {
 
     /// 启动 4 个后端进程 + 启动计时。**不**直接写 init pings —
     /// 见 `appendStartupPings(afterLaunch:)` 的注释。
-    /// - 已在跑的同名进程会被忽略 (避免覆盖用户测试中的实例)
+    /// - spawn 前先 pkill 清掉孤儿后端 (App 崩溃/旧版漏杀留下的 detached
+    ///   进程会和新实例并发写 /tmp/whicc-out,下载互踩、字幕交错)
     /// - 启动失败不抛异常,只 stderr 输出 (避免 UI 启动被一个进程问题阻断)
     ///
     /// 时序原因:EventWatcher.start() 启动时 seek 到 translation_events.jsonl
@@ -143,6 +144,20 @@ final class BackendLauncher {
                 logName: "model-downloader.log"
             ),
         ]
+
+        // ── 启动前清场:杀掉孤儿后端进程 ──
+        // App 崩溃/强退时 detached 子进程活下来;旧版 terminateBackends
+        // 还漏杀 model_downloader,实测一台机器堆了 16 个下载守护进程,
+        // 同时抢下同一个模型互相卡死。spawn 前统一清一次,顺带把存量
+        // 僵尸也治了。同步等 pkill 完成(<100ms)再 spawn,避免旧进程
+        // 还握着单实例锁/audiotee。
+        let sweeper = Process()
+        sweeper.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        sweeper.arguments = ["-9", "-f", backendPkillPattern]
+        sweeper.standardOutput = FileHandle.nullDevice
+        sweeper.standardError = FileHandle.nullDevice
+        try? sweeper.run()
+        sweeper.waitUntilExit()
 
         _monitorLock.lock()
         _spawnContext = (python: python, src: src, logDir: logDir)
@@ -506,13 +521,21 @@ final class BackendLauncher {
         _monitorLock.unlock()
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-9", "-f", "whicc-audio|glossary_refresher|translate_stream|whicc.py"]
+        // model_downloader 必须在清单里:之前漏掉它,App 每退出一次就留
+        // 一个永不退出的下载守护进程,堆积的多个实例同时抢下同一个模型
+        // (huggingface_hub 文件锁互相卡死),表现为"模型永远下载不完"。
+        task.arguments = ["-9", "-f", backendPkillPattern]
         task.standardOutput = FileHandle.nullDevice
         task.standardError = FileHandle.nullDevice
         try? task.run()
         // 不 waitUntilExit — applicationWillTerminate 在主线程,pkill 异步
         // 跑,SwiftUI 在 pkill 跑完前已经退到系统级清理流程。
     }
+
+    /// 后端进程的 pkill -f 匹配模式 — terminateBackends(退出清场)和
+    /// launchBackendsIfNeeded(启动前清孤儿)共用,避免两处清单不同步。
+    private static let backendPkillPattern =
+        "whicc-audio|glossary_refresher|translate_stream|model_downloader|whicc.py"
 
     // MARK: - 子进程存活监控
 
@@ -529,6 +552,12 @@ final class BackendLauncher {
     /// - whicc.py: ASR 模型未下载/残缺
     /// - translate_stream.py: 翻译服务 URL 未配置 / 翻译未启用
     private static let _exitWaitingConfig: Int32 = 3
+
+    /// 音频自愈重启的约定退出码(恢复性,不是故障):whicc.py 检测到
+    /// 音频源 12s 无数据(macOS process tap 对 respawn 的 audiotee 静默
+    /// 拒绝授权)主动退出,由监控拉起新进程重新拿授权。给"正在自动
+    /// 恢复"文案,别用"异常退出"吓用户。
+    private static let _exitAudioRecover: Int32 = 4
 
     private static var _monitored: [MonitoredProc] = []
     private static let _monitorLock = NSLock()
@@ -560,6 +589,7 @@ final class BackendLauncher {
             guard !m.process.isRunning else { continue }
             let code = m.process.terminationStatus
             let waiting = (code == _exitWaitingConfig)
+            let audioRecover = (code == _exitAudioRecover)
             // 退避:快速重启次数耗尽后,每 _slowRetryInterval 才试一次。
             // 例外:"等配置"退出(code 3)时,对应资源一就绪就立即重启 —
             // whicc.py 等 models 目录出现新 .complete(模型下载完成),
@@ -578,12 +608,15 @@ final class BackendLauncher {
             let n = _monitored[i].restarts
             logAndStderr("[monitor] \(m.backend.script) exited (code \(code)), "
                          + "restart #\(n)\(n > _fastRestarts ? " (slow retry)" : "")")
-            if waiting {
-                // 配置性等待,不是故障 — 给指引而不是吓人的"异常退出";
-                // 只发一次,静默重试。
+            if waiting || audioRecover {
+                // 配置性等待 / 音频自愈,不是故障 — 给指引而不是吓人的
+                // "异常退出";只发一次,静默重试。
                 if !m.waitingNoticeShown {
                     _monitored[i].waitingNoticeShown = true
-                    let (zh, en) = waitingNotice(script: m.backend.script)
+                    let (zh, en) = audioRecover
+                        ? ("🎧 系统音频捕获中断(输出设备切换/录音授权变化),正在自动恢复…",
+                           "🎧 System audio capture interrupted (device switch / permission change); recovering automatically…")
+                        : waitingNotice(script: m.backend.script)
                     appendBackendNotice(zh: zh, en: en)
                 }
             } else {
