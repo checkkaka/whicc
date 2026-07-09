@@ -173,7 +173,11 @@ final class ModelState: ObservableObject {
     /// 后台轮询本来就每 3 秒扫一次,这个方法只是给用户一个「我刚刚
     /// 下载完了 / 我改了目录,帮我立刻看下」的入口。底层直接走
     /// reload(),不绕轮询线程——磁盘 IO 在主线程外做,SwiftUI 不会卡。
+    /// 手动刷新意味着"目录可能被我改过" → 先清大小缓存再扫。
     func requestReload() {
+        Self._sizeCacheLock.lock()
+        Self._sizeCache.removeAll()
+        Self._sizeCacheLock.unlock()
         reload()
     }
 
@@ -221,8 +225,6 @@ final class ModelState: ObservableObject {
             // 跳过非目录
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { continue }
-            // 计算目录大小（递归）
-            let size = Self.directorySize(at: url)
             let dirName = url.lastPathComponent
             let id = dirName.replacingOccurrences(of: "--", with: "/")
             let displayName = id.split(separator: "/").last.map(String.init) ?? id
@@ -235,6 +237,10 @@ final class ModelState: ObservableObject {
             // 完整性未知 → 留给上层不当作"绿勾"判定。
             let completeMarker = url.appendingPathExtension("complete")
             let isComplete = fm.fileExists(atPath: completeMarker.path)
+            // 目录大小:已完成的模型目录内容不再变化,大小缓存起来 —
+            // 不然每 3s 轮询都对多 GB 的分片文件做一次全量递归遍历。
+            // 下载中(isComplete=false)保持实时扫,进度条才会动。
+            let size = Self.cachedDirectorySize(at: url, cacheable: isComplete)
             results.append(ModelInfo(
                 id: id,
                 displayName: displayName,
@@ -247,6 +253,26 @@ final class ModelState: ObservableObject {
         }
         // 默认按 size 降序（用户一般关心大模型）
         return results.sorted { $0.sizeBytes > $1.sizeBytes }
+    }
+
+    /// 已完成模型的目录大小缓存(路径 → 字节)。polling 线程和主线程
+    /// (requestReload → reload)都会进 scanModels,加锁保护。
+    private static var _sizeCache: [String: Int64] = [:]
+    private static let _sizeCacheLock = NSLock()
+
+    /// directorySize 的缓存包装:cacheable(=已完成模型)命中直接返回,
+    /// 未命中算一次后记入;不可缓存(下载中)每次实时扫。
+    private static func cachedDirectorySize(at url: URL, cacheable: Bool) -> Int64 {
+        guard cacheable else { return directorySize(at: url) }
+        _sizeCacheLock.lock()
+        let cached = _sizeCache[url.path]
+        _sizeCacheLock.unlock()
+        if let cached { return cached }
+        let size = directorySize(at: url)
+        _sizeCacheLock.lock()
+        _sizeCache[url.path] = size
+        _sizeCacheLock.unlock()
+        return size
     }
 
     /// 递归计算目录占用字节数。只算 regular file 的大小，跳过 symlink。

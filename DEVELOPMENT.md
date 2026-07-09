@@ -634,7 +634,9 @@ open /Applications/whicc.app
 
 ### 前置（一次性）
 
-1. **Xcode 26**（macOS 26 SDK，MLX wheel 硬绑定 `macosx_26_0_arm64`）
+1. **Xcode 26**（编译需要 macOS 26 SDK — `GlassEffectContainer` 的
+   `if #available(macOS 26.0, *)` 分支要 SDK 里有符号才能编译;部署目标是
+   15.0,产物可跑在 macOS 15+）
 2. **Python 3.13**（`/opt/homebrew/bin/python3.13` 或 `python3.13` 在 PATH）
 3. **xcodegen**（`brew install xcodegen`）
 
@@ -727,7 +729,9 @@ open /Applications/whicc.app
 ### 已知限制
 
 - **Adhoc 签名** — 不能发布给其他 Mac。正式分发需 Developer ID + 公证。
-- **MLX wheel 硬绑定** `macosx_26_0_arm64` — Intel Mac / 旧 macOS 不可用。
+- **MLX wheel 仅 Apple Silicon** — mlx 官方 wheel 提供 `macosx_14_0/15_0/26_0_arm64`
+  三档(pip 按构建机系统自动选;CI 在 macos-15 runner 上装到 15_0)。Intel Mac 不可用;
+  macOS 14.x 理论可跑但未测试(audiotee 需 14.4+,部署目标定在 15.0)。
 - **~566MB 安装包** — venv 装满所有依赖（slim 版）。已知间接依赖（~97MB scipy
   来自 mlx-audio）未剔除，需要时手动 delete。
 

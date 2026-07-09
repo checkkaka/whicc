@@ -10,7 +10,14 @@ import Foundation
 ///
 /// 开发模式 (`swift run` 或 `macui/.build/debug/whicc-macui`):不主动
 /// 启动后端 — 用户自己跑 `swift run whicc.py` 等。
-@MainActor
+///
+/// 并发:本类只做文件 IO / Process spawn / 日志轮询,不碰 UI,**不**标
+/// @MainActor — launchBackendsIfNeeded 里的 waitForASRReady 会阻塞
+/// 最长 10s,必须能在后台队列跑(main.swift 的启动链把它丢到
+/// DispatchQueue.global,完成后 hop 回主线程写 pings)。静态可变状态
+/// (_launchStartTime/_pendingPings) 的访问由调用方的串行时序保证:
+/// BG 队列 launchBackendsIfNeeded 写 → main.async appendStartupPings 读,
+/// dispatch 边界自带 happens-before。
 final class BackendLauncher {
     private struct BackendProc {
         let script: String
@@ -21,7 +28,7 @@ final class BackendLauncher {
     /// launchBackendsIfNeeded() 入口记录的启动时戳。appendStartupPings
     /// 用它算"打开 .app → ASR ready"的总耗时。class-level 静态属性 —
     /// 打包模式整个 app 生命周期只会调一次 launchBackendsIfNeeded +
-    /// appendStartupPings,不需要担心 thread safety (整个类 @MainActor)。
+    /// appendStartupPings,访问时序由启动链串行保证(见类注释)。
     private static var _launchStartTime: Date?
 
     /// 启动 4 个后端进程 + 启动计时。**不**直接写 init pings —
@@ -100,7 +107,6 @@ final class BackendLauncher {
                     "--models-dir", modelsDir,
                     "--model", defaultModel,
                     "--language", "auto",
-                    "--mode", "streaming",
                     "--audio-source", "system",
                     "--audio-bin", audioteePath,
                 ],
@@ -138,9 +144,24 @@ final class BackendLauncher {
             ),
         ]
 
+        _monitorLock.lock()
+        _spawnContext = (python: python, src: src, logDir: logDir)
+        _monitored.removeAll()
+        _monitorLock.unlock()
         for backend in backends {
-            spawn(python: python, src: src, backend: backend, logDir: logDir)
+            if let proc = spawn(python: python, src: src, backend: backend,
+                                logDir: logDir) {
+                _monitorLock.lock()
+                _monitored.append(MonitoredProc(backend: backend,
+                                                process: proc, restarts: 0,
+                                                lastRestartAt: nil))
+                _monitorLock.unlock()
+            }
         }
+        // 存活监控:之前 spawn 完就不管了,whicc.py 崩掉后 UI 永远停在
+        // "正在聆听"(launcher 只扫日志关键词,不看进程死活 — SOP.md
+        // 记录过的盲点)。
+        startProcessMonitor()
 
         // ── 等待 ASR ready → 算总耗时 → 准备 banner ping 文案 ──
         // ASR 启动后 stdout 会打 "模型就绪。启动系统音频捕获..." (whicc.py:885),
@@ -256,14 +277,19 @@ final class BackendLauncher {
     }
 
     /// scan 日志等 "模型就绪" 关键词,带超时。返回 ready 时戳或 fallback 时戳。
+    /// 跑在后台队列(调用方保证),阻塞最长 deadline-now。
     private static func waitForASRReady(logPath: String, deadline: Date) -> Date {
         let keywords = ["模型就绪", "启动系统音频"]
         let pollInterval: TimeInterval = 0.1
-        let scanLines = 8  // 只扫文件末尾 N 行,日志可能很大
+        let tailBytes: UInt64 = 4096  // 只读文件尾,不每 0.1s 重读整份日志
         while Date() < deadline {
-            if let content = try? String(contentsOfFile: logPath, encoding: .utf8) {
-                let tail = content.split(separator: "\n").suffix(scanLines).joined(separator: "\n")
-                if keywords.contains(where: tail.contains) {
+            if let fh = FileHandle(forReadingAtPath: logPath) {
+                let size = fh.seekToEndOfFile()
+                fh.seek(toFileOffset: size > tailBytes ? size - tailBytes : 0)
+                let data = fh.readDataToEndOfFile()
+                fh.closeFile()
+                if let tail = String(data: data, encoding: .utf8),
+                   keywords.contains(where: tail.contains) {
                     return Date()
                 }
             }
@@ -328,7 +354,9 @@ final class BackendLauncher {
         try? handle.synchronize()
     }
 
-    private static func spawn(python: String, src: String, backend: BackendProc, logDir: String) {
+    @discardableResult
+    private static func spawn(python: String, src: String, backend: BackendProc,
+                              logDir: String, truncateLogs: Bool = true) -> Process? {
         fputs("[BackendLauncher] spawn \(backend.script) log=\(logDir)/\(backend.logName)\n", stderr)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
@@ -338,12 +366,16 @@ final class BackendLauncher {
         let stdoutPath = logDir + "/" + backend.logName
         let stderrPath = stdoutPath.replacingOccurrences(of: ".log", with: ".err.log")
         // truncate 模式 — 每次启动清空旧 log。
-        for path in [stdoutPath, stderrPath] {
-            do {
-                let empty = Data()
-                try empty.write(to: URL(fileURLWithPath: path))
-            } catch {
-                fputs("[BackendLauncher] WARN failed to create log \(path): \(error)\n", stderr)
+        // 崩溃后的自动重启传 truncateLogs=false:保留崩溃现场日志,
+        // 新输出 append 在后面。
+        if truncateLogs {
+            for path in [stdoutPath, stderrPath] {
+                do {
+                    let empty = Data()
+                    try empty.write(to: URL(fileURLWithPath: path))
+                } catch {
+                    fputs("[BackendLauncher] WARN failed to create log \(path): \(error)\n", stderr)
+                }
             }
         }
         // C6 修:stdout / stderr 用独立 FileHandle(独立 fd)。之前共用
@@ -358,8 +390,14 @@ final class BackendLauncher {
             // 退路:用 Pipe() 否则 Swift 端崩溃
             process.standardOutput = Pipe().fileHandleForWriting
             process.standardError = Pipe().fileHandleForWriting
-            try? process.run()
-            return
+            do { try process.run() } catch { return nil }
+            return process
+        }
+        if !truncateLogs {
+            // append 模式(崩溃重启):FileHandle 默认 offset=0 会覆盖
+            // 崩溃现场,seek 到尾部续写。
+            out.seekToEndOfFile()
+            err.seekToEndOfFile()
         }
         process.standardOutput = out
         process.standardError = err
@@ -371,7 +409,9 @@ final class BackendLauncher {
             fputs("[BackendLauncher] started \(backend.script) pid=\(process.processIdentifier)\n", stderr)
         } catch {
             fputs("[BackendLauncher] FAILED to start \(backend.script): \(error)\n", stderr)
+            return nil
         }
+        return process
     }
 
     /// 翻译节点总开关的默认值处理。
@@ -458,6 +498,12 @@ final class BackendLauncher {
     /// 丢到后台 Task 不阻塞主线程。
     static func terminateBackends() {
         guard AppPaths.isBundledApp else { return }
+        // 先停监控 — 不然它会把我们主动杀掉的进程又拉起来。
+        _monitorTimer?.cancel()
+        _monitorTimer = nil
+        _monitorLock.lock()
+        _monitored.removeAll()
+        _monitorLock.unlock()
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
         task.arguments = ["-9", "-f", "whicc-audio|glossary_refresher|translate_stream|whicc.py"]
@@ -466,5 +512,205 @@ final class BackendLauncher {
         try? task.run()
         // 不 waitUntilExit — applicationWillTerminate 在主线程,pkill 异步
         // 跑,SwiftUI 在 pkill 跑完前已经退到系统级清理流程。
+    }
+
+    // MARK: - 子进程存活监控
+
+    private struct MonitoredProc {
+        let backend: BackendProc
+        var process: Process
+        var restarts: Int
+        var lastRestartAt: Date?
+        /// "等配置/等模型"提示(exit 3)只发一次,避免每次重试都刷通知。
+        var waitingNoticeShown = false
+    }
+
+    /// 后端"等待配置/资源"的约定退出码 — 配置性等待,不是故障:
+    /// - whicc.py: ASR 模型未下载/残缺
+    /// - translate_stream.py: 翻译服务 URL 未配置 / 翻译未启用
+    private static let _exitWaitingConfig: Int32 = 3
+
+    private static var _monitored: [MonitoredProc] = []
+    private static let _monitorLock = NSLock()
+    private static var _monitorTimer: DispatchSourceTimer?
+    private static var _spawnContext: (python: String, src: String, logDir: String)?
+    /// 快速重启上限 — 连续崩这么多次后退避到慢速重试(模型未下载等
+    /// 持续性故障不值得每 5s 拉一次,但下载完成后慢速重试能自动恢复)。
+    private static let _fastRestarts = 3
+    private static let _slowRetryInterval: TimeInterval = 300
+
+    private static func startProcessMonitor() {
+        guard _monitorTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { checkProcesses() }
+        timer.resume()
+        _monitorTimer = timer
+        logAndStderr("[monitor] process liveness monitor started (5s interval)")
+    }
+
+    private static func checkProcesses() {
+        guard let ctx = _spawnContext else { return }
+        _monitorLock.lock()
+        defer { _monitorLock.unlock() }
+        let now = Date()
+        for i in _monitored.indices {
+            let m = _monitored[i]
+            guard !m.process.isRunning else { continue }
+            let code = m.process.terminationStatus
+            let waiting = (code == _exitWaitingConfig)
+            // 退避:快速重启次数耗尽后,每 _slowRetryInterval 才试一次。
+            // 例外:"等配置"退出(code 3)时,对应资源一就绪就立即重启 —
+            // whicc.py 等 models 目录出现新 .complete(模型下载完成),
+            // translate_stream.py 等 lang_config.json 更新(用户填了
+            // 服务地址,debounce 自动保存) — 秒恢复,不等慢速窗口。
+            if m.restarts >= _fastRestarts,
+               let last = m.lastRestartAt,
+               now.timeIntervalSince(last) < _slowRetryInterval {
+                if !(waiting && waitedResourceReady(script: m.backend.script, since: last)) {
+                    continue
+                }
+                logAndStderr("[monitor] waited resource ready, restarting \(m.backend.script) immediately")
+            }
+            _monitored[i].restarts += 1
+            _monitored[i].lastRestartAt = now
+            let n = _monitored[i].restarts
+            logAndStderr("[monitor] \(m.backend.script) exited (code \(code)), "
+                         + "restart #\(n)\(n > _fastRestarts ? " (slow retry)" : "")")
+            if waiting {
+                // 配置性等待,不是故障 — 给指引而不是吓人的"异常退出";
+                // 只发一次,静默重试。
+                if !m.waitingNoticeShown {
+                    _monitored[i].waitingNoticeShown = true
+                    let (zh, en) = waitingNotice(script: m.backend.script)
+                    appendBackendNotice(zh: zh, en: en)
+                }
+            } else {
+                appendBackendNotice(
+                    zh: "⚠️ 后端 \(m.backend.script) 异常退出(code \(code)),自动重启中 #\(n)",
+                    en: "⚠️ Backend \(m.backend.script) exited (code \(code)); auto-restarting #\(n)")
+            }
+            if let p = spawn(python: ctx.python, src: ctx.src,
+                             backend: m.backend, logDir: ctx.logDir,
+                             truncateLogs: false) {
+                _monitored[i].process = p
+            }
+        }
+    }
+
+    /// 用户主动重启某个后端(如 ServerPane 的"保存并重启翻译服务")的
+    /// **统一通道** — 必须走这里而不是自行 pkill+spawn:监控 5s 内会把
+    /// pkill 掉的进程当"死亡"再拉起一个,跟按钮自己 spawn 的撞成
+    /// **双实例**,并发写 translation_events.jsonl → 字幕重复交错。
+    /// 本方法持监控锁完成 杀旧+respawn+更新注册表,监控全程看到的是
+    /// 一致状态;spawn 参数/日志路径与首次启动完全同款(含 --force-enable)。
+    ///
+    /// 返回 false = 打包模式未启动(dev 模式)或未知脚本,调用方可走
+    /// dev 模式的兜底路径。
+    @discardableResult
+    static func restartBackend(script: String) -> Bool {
+        _monitorLock.lock()
+        defer { _monitorLock.unlock() }
+        guard let ctx = _spawnContext,
+              let i = _monitored.firstIndex(where: { $0.backend.script == script }) else {
+            return false
+        }
+        let old = _monitored[i].process
+        if old.isRunning {
+            old.terminate()  // SIGTERM,让 Python 侧 flush 日志
+            let deadline = Date().addingTimeInterval(2)
+            while old.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if old.isRunning {
+                kill(old.processIdentifier, SIGKILL)
+            }
+        }
+        logAndStderr("[monitor] user-requested restart of \(script)")
+        guard let p = spawn(python: ctx.python, src: ctx.src,
+                            backend: _monitored[i].backend, logDir: ctx.logDir,
+                            truncateLogs: true) else {
+            return false
+        }
+        _monitored[i].process = p
+        _monitored[i].restarts = 0            // 用户主动重启,计数清零
+        _monitored[i].lastRestartAt = Date()
+        _monitored[i].waitingNoticeShown = false
+        return true
+    }
+
+    /// "等配置"退出(code 3)的字幕区指引文案,按脚本区分。
+    private static func waitingNotice(script: String) -> (zh: String, en: String) {
+        switch script {
+        case "whicc.py":
+            return ("⏳ 语音识别模型未就绪 — 请到 设置 → 模型 页下载;完成后自动开始识别",
+                    "⏳ ASR model not ready — download it in Settings → Models; recognition starts automatically once done")
+        case "translate_stream.py":
+            return ("💬 翻译服务未配置 — 到 设置 → 服务配置 填写地址即可启用;不配置也能看原文字幕",
+                    "💬 Translation not configured — set the service address in Settings → Server to enable; source-only captions work without it")
+        default:
+            return ("⏳ 后端 \(script) 等待配置中,就绪后自动启动",
+                    "⏳ Backend \(script) waiting for configuration; starts automatically once ready")
+        }
+    }
+
+    /// code 3 等待的资源是否已就绪(比 `since` 更新):
+    /// - whicc.py: models 目录出现新 .complete 标记(模型下载完成)
+    /// - translate_stream.py: lang_config.json 被更新(用户保存了配置)
+    private static func waitedResourceReady(script: String, since: Date) -> Bool {
+        let fm = FileManager.default
+        switch script {
+        case "whicc.py":
+            let modelsDir = NSHomeDirectory() + "/Library/Application Support/whicc/models"
+            guard let entries = try? fm.contentsOfDirectory(atPath: modelsDir) else { return false }
+            for name in entries where name.hasSuffix(".complete") {
+                if let attrs = try? fm.attributesOfItem(atPath: modelsDir + "/" + name),
+                   let mtime = attrs[.modificationDate] as? Date,
+                   mtime > since {
+                    return true
+                }
+            }
+            return false
+        case "translate_stream.py":
+            let cfgPath = AppPaths.runDir + "/lang_config.json"
+            if let attrs = try? fm.attributesOfItem(atPath: cfgPath),
+               let mtime = attrs[.modificationDate] as? Date,
+               mtime > since {
+                return true
+            }
+            return false
+        default:
+            return false
+        }
+    }
+
+    /// 往 translation_events.jsonl 追加一条通知(translation_final 事件),
+    /// 走 EventWatcher → OverlayState 的既有链路显示在字幕区 — 用户
+    /// 能直接看到"后端崩了/已重启",不用去翻日志。
+    private static func appendBackendNotice(zh: String, en: String) {
+        let transLogPath = AppPaths.runDir + "/translation_events.jsonl"
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        let entry: [String: Any] = [
+            "event_type": "translation_final",
+            "source_key": "monitor-\(ts)",
+            "source_update_mode": "reset_full",
+            "source_text": en,
+            "translated_full_text": zh,
+            "translate_ms": 0,
+            "shared_prefix_len": 0,
+            "glossary_hits": [],
+            "retried": false,
+            "fallback_reason": "",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: entry),
+              var line = String(data: data, encoding: .utf8),
+              let handle = FileHandle(forWritingAtPath: transLogPath) else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        line += "\n"
+        if let bytes = line.data(using: .utf8) {
+            handle.write(bytes)
+        }
     }
 }

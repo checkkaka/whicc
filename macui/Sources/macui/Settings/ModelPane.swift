@@ -25,6 +25,7 @@ import AppKit
 struct ModelPane: View {
     @ObservedObject var modelState: ModelState
     @ObservedObject var downloadState: ModelDownloadState
+    @ObservedObject var langConfig: LangConfig
 
     var body: some View {
         SettingsDetailContainer {
@@ -68,7 +69,7 @@ struct ModelPane: View {
                 .foregroundColor(.secondary)
                 .padding(.horizontal, 4)
 
-            // 存储位置 + 在 Finder 中显示
+            // 存储位置 + 在 Finder 中显示 + 下载加速开关
             SettingsCard {
                 Text("存储位置")
                     .font(.system(size: 12, weight: .semibold))
@@ -85,6 +86,25 @@ struct ModelPane: View {
                     }
                     .controlSize(.small)
                 }
+                Divider()
+                // 下载加速:直连 huggingface.co 缓慢/受限的网络环境开这个,
+                // 模型下载走 hf-mirror.com 镜像。切换后下一次下载即生效
+                // (下载中的任务不受影响,取消重下即可走镜像 — 断点续传
+                // 不浪费已下载的部分)。
+                Toggle(isOn: Binding(
+                    get: { langConfig.hfMirrorEnabled },
+                    set: { langConfig.setHfMirrorEnabled($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("下载加速（HF 镜像）")
+                            .font(.system(size: 12))
+                        Text("下载缓慢时开启，模型改走 hf-mirror.com；海外网络建议保持关闭")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
             }
 
             // 槽位 1：中文识别
@@ -98,7 +118,7 @@ struct ModelPane: View {
                     isRecommendedReady: isFullyDownloaded(Self.recommendedChineseASR),
                     currentValue: Binding(
                         get: { modelState.chineseASR },
-                        set: { modelState.setChineseASR($0) }
+                        set: { modelState.setChineseASR($0); Self.restartASRBackend() }
                     ),
                     isCurrentReady: isFullyDownloaded(modelState.chineseASR),
                     onDownload: { downloadState.requestDownload(modelId: $0) }
@@ -113,7 +133,7 @@ struct ModelPane: View {
                     isRecommendedReady: isFullyDownloaded(Self.recommendedNonChineseASR),
                     currentValue: Binding(
                         get: { modelState.nonChineseASR },
-                        set: { modelState.setNonChineseASR($0) }
+                        set: { modelState.setNonChineseASR($0); Self.restartASRBackend() }
                     ),
                     isCurrentReady: isFullyDownloaded(modelState.nonChineseASR),
                     onDownload: { downloadState.requestDownload(modelId: $0) }
@@ -321,18 +341,24 @@ struct ModelPane: View {
             .labelsHidden()
             .pickerStyle(.menu)
 
-            // 选"其他"时才显示手动输入框
+            // 选"其他"时才显示手动输入框。
+            // DebouncedModelField(定义在 ServerPane.swift):0.5s 停手才
+            // 提交 setter — 之前直接绑 currentValue,每个按键立即
+            // writeField 同步写盘 + reload,ModelState 3s 轮询回读还会
+            // 把正在输入的内容覆盖回磁盘旧值(打字被吃/光标乱跳)。
             if currentValue.wrappedValue != recommendedID {
-                TextField("mlx-community/", text: currentValue)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, design: .monospaced))
+                DebouncedModelField(
+                    placeholder: "mlx-community/",
+                    current: currentValue.wrappedValue,
+                    onCommit: { currentValue.wrappedValue = $0 }
+                )
             }
 
             // 状态提示
             // 1. 空值 → "（未设置）"
-            // 2. 推荐 ID 且本地有 → "切换后需重启app生效"
+            // 2. 推荐 ID 且本地有 → "切换后自动重启识别,数秒内生效"
             // 3. 推荐 ID 且本地没有 → "本地未下载" + [下载] 按钮（手动触发，符合 macOS HIG）
-            // 4. 其他（手输的 ID）→ "切换后需重启app生效"（不管本地有没有，逻辑同上）
+            // 4. 其他（手输的 ID）→ 同 2（不管本地有没有）
             if currentValue.wrappedValue.isEmpty {
                 Text("（未设置）")
                     .font(.caption).foregroundColor(.secondary)
@@ -350,9 +376,20 @@ struct ModelPane: View {
                     .buttonStyle(.borderedProminent)
                 }
             } else {
-                Text("切换后需重启app生效")
+                Text("切换后自动重启识别后端，数秒内生效")
                     .font(.caption).foregroundColor(.secondary)
             }
+        }
+    }
+
+    /// 槽位变更后重启 whicc.py,让新模型立即生效 — 之前提示重启 app,
+    /// 而实际上重启 app 也不生效(后端只读旧 current_model 字段,
+    /// 槽位键无人消费,已在 model_state.py 修复)。
+    /// 走 BackendLauncher 统一重启通道(与监控协调,不会双实例);
+    /// dev 模式(通道返回 false)静默跳过,用户自管后端。
+    private static func restartASRBackend() {
+        Task.detached(priority: .userInitiated) {
+            _ = BackendLauncher.restartBackend(script: "whicc.py")
         }
     }
 
@@ -459,6 +496,11 @@ struct ModelPane: View {
                 let downloaded = Self.formatBytes(dl.downloadedBytes)
                 let total = Self.formatBytes(dl.totalBytes)
                 return "\(pct)%  \(downloaded) / \(total)"
+            }
+            // 总大小未知(镜像/网络拿不到元数据)但字节在动 — 显示
+            // 已下载量,别让用户以为卡死
+            if dl.downloadedBytes > 0 {
+                return "已下载 \(Self.formatBytes(dl.downloadedBytes))"
             }
             return "准备中…"
         case .completed:

@@ -92,7 +92,7 @@ export RELEASE_VERSION="0.2.0"
 
 ### 2.1 更新 `DEVELOPMENT.md` 的「本地化与翻译」章节（如有变化）
 
-不需要每次都改，但发布前确认 `macOS 26+` / `Python 3.13` 等版本要求还正确。
+不需要每次都改，但发布前确认 `macOS 15+` / `Python 3.13` 等版本要求还正确。
 
 ### 2.2 更新 `README.md` 的「路线图」section
 

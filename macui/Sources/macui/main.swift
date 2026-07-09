@@ -241,89 +241,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try controller.show(using: config)
             self.windowController = controller
 
-            // ---- 后台跑重活 ----
-            // 阶段 1:启动 4 个 Python 后端。阶段 2:扫模型目录算 size。
-            // 完成后 banner 转 "正在聆听",真正的 listening 后端 ping 来了再
-            // 由 OverlayState.applyStartupText 翻 listening=true → "准备就绪"。
-            //
-            // 注:BackendLauncher 是 @MainActor,必须在主线程调。后台 queue
-            // 只用来做"短暂的 stage 过渡",让用户看到 banner 文本切换 —
-            // 实际重活(BE launcher + polling)仍然在主线程跑,跟之前一样
-            // 阻塞主线程。但 banner 已经先显示了,用户视觉上不再"卡死",
-            // Dock 图标也已经出现,这是这次修复的核心。
-            //
-            // 进一步:把 ModelState init + BE launch 一起丢后台需要在更早
-            // 时候就改 actor isolation(把 BackendLauncher 改成非 @MainActor
-            // 或加 async 接口),改起来涉及面广,留到下次。
-            //
-            // 阶段间隔:每个 stage 至少停留 0.5s,用户能看清楚进度;
-            // 实际主线程重活跑得更久(launchBackends ~100ms 但加上 model
-            // scan 几百 ms),所以这里设最小停留不会拖慢整体完成时间。
-            //
-            // 打包模式:BackendLauncher 在 launchBackendsIfNeeded() 内部完成 spawn +
-            // 等 ASR ready + 准备 banner ping 文案 (但不写文件 — 时序原因见
-            // appendStartupPings 注释)。EventWatcher 起来后 main.swift 调
-            // appendStartupPings(afterLaunch:) 才写 banner-shape init pings,
-            // banner 立刻从 "正在聆听" → "准备就绪 · X.XXs" → 1.8s 后
-            // auto-dismiss。
-            func advanceStage(_ next: StartupStage) {
-                let lastChange = Date()
-                DispatchQueue.main.async { [weak state] in
-                    state?.startupSummary?.stage = next
-                }
-                // 至少停留 0.5s,但如果主线程真的还在跑(下次 stage 切换被
-                // 同步阻塞),这段 Thread.sleep 会自然让出实际时间。
-                let elapsed = Date().timeIntervalSince(lastChange)
-                let remaining = 0.5 - elapsed
-                if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
-            }
-            advanceStage(.launchingBackends)
-            BackendLauncher.launchBackendsIfNeeded()
-            advanceStage(.scanningModels)
-
-            glossaryState.startPolling()
-            eventAgentState.startPolling()
-            modelState.startPolling()
-            let downloadState = ModelDownloadState()
-            downloadState.startPolling()
-            self.downloadState = downloadState
-
-            // banner 切到 listening。EventWatcher 起后由 appendStartupPings(afterLaunch:)
-            // 写 4 条 init pings,banner 翻成 "准备就绪 · X.XXs" → 1.8s 后
-            // auto-dismiss。
-            advanceStage(.listening)
-
-            // Wire the NSMenu language callback.
+            // Wire the NSMenu language callback.(轻,留在主线程)
             MenuActionHandler.shared.onLanguagePicked = { [weak langConfig] langId in
                 langConfig?.setLang(langId)
             }
 
-            // JSONL watchers
-            let watcher = EventWatcher(path: config.eventsPath) { [weak self] event in
-                self?.state.apply(event)
-            }
-            watcher.start()
-            self.watcher = watcher
+            // ---- 后台跑重活 ----
+            // BackendLauncher(spawn 4 个 Python 后端 + waitForASRReady 最长
+            // 10s 的日志轮询)整体搬到后台队列 — 启动期间主线程不再被阻塞,
+            // banner/窗口全程可交互。UI 更新(stage/polling/watcher/pings)
+            // hop 回主线程。
+            //
+            // 时序约束(必须保序,乱序 banner 就不工作):
+            //   1. launchBackendsIfNeeded  — 创建 jsonl 占位文件 + spawn +
+            //      等 ASR ready + 准备 ping 文案(不写文件)
+            //   2. EventWatcher.start      — seek 到 jsonl 文件尾
+            //   3. appendStartupPings      — append 4 条 init pings,
+            //      DispatchSource 立刻触发 → banner "准备就绪 · X.XXs"
+            //      → 1.8s 后 auto-dismiss
+            //   提前写 pings 会被 2 的 seek 跳过 — 详见 appendStartupPings 注释。
+            // 整条链在同一个 BG 闭包里串行执行,天然保序。
+            //
+            DispatchQueue.global(qos: .userInitiated).async { [weak self, weak state] in
+                Self.advanceStage(.launchingBackends, state: state)
+                BackendLauncher.launchBackendsIfNeeded()
+                Self.advanceStage(.scanningModels, state: state)
 
-            if let transPath = config.transEventsPath {
-                let transWatcher = EventWatcher(path: transPath) { [weak self] event in
-                    self?.state.applyTranscription(event)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    glossaryState.startPolling()
+                    eventAgentState.startPolling()
+                    modelState.startPolling()
+                    let downloadState = ModelDownloadState()
+                    downloadState.startPolling()
+                    self.downloadState = downloadState
                 }
-                transWatcher.start()
-                self.transWatcher = transWatcher
-            }
 
-            // EventWatcher 已经在文件尾 (seekToEndOfFile),appendStartupPings
-            // append 4 条 banner-shape init pings → DispatchSource 立刻触发
-            // → banner 翻 "准备就绪 · X.XXs" → 1.8s 后 auto-dismiss。
-            // 不在 launchBackendsIfNeeded 内部写是因为 EventWatcher 启动时
-            // 会 seek 到文件尾,提前写会让 seek 跳过这 4 条。
-            BackendLauncher.appendStartupPings(afterLaunch: true)
+                // banner 切到 listening。init pings 到达后 OverlayState
+                // .applyStartupPing 再翻 "准备就绪"。
+                Self.advanceStage(.listening, state: state)
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    // JSONL watchers — 在 launchBackends 之后启动:占位
+                    // jsonl 已创建,start() 一次成功并 seek 到文件尾。
+                    let watcher = EventWatcher(path: config.eventsPath) { [weak self] event in
+                        self?.state.apply(event)
+                    }
+                    watcher.start()
+                    self.watcher = watcher
+
+                    if let transPath = config.transEventsPath {
+                        let transWatcher = EventWatcher(path: transPath) { [weak self] event in
+                            self?.state.applyTranscription(event)
+                        }
+                        transWatcher.start()
+                        self.transWatcher = transWatcher
+                    }
+
+                    // EventWatcher 已经在文件尾,append 4 条 banner-shape
+                    // init pings → DispatchSource 立刻触发。
+                    BackendLauncher.appendStartupPings(afterLaunch: true)
+                }
+            }
 
         } catch {
             fputs("Error: \(error.localizedDescription)\n", stderr)
             NSApp.terminate(nil)
         }
+    }
+
+    /// 更新启动 banner stage(hop 主线程)并让**调用线程**至少停留 0.5s,
+    /// 用户能看清 banner 进度文本切换。nonisolated static — 从 BG 启动链
+    /// 调用,sleep 落在 BG 队列,不阻塞主线程。
+    nonisolated private static func advanceStage(_ next: StartupStage, state: OverlayState?) {
+        let lastChange = Date()
+        DispatchQueue.main.async { [weak state] in
+            state?.startupSummary?.stage = next
+        }
+        let elapsed = Date().timeIntervalSince(lastChange)
+        let remaining = 0.5 - elapsed
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
     }
 
     // MARK: - Settings window
@@ -351,9 +349,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func openSettings() {
+        // 顺序关键:必须**先 activate 再 makeKey**。macOS 14+ 协作式
+        // 激活下,app 未激活时 makeKeyAndOrderFront 的 makeKey 部分会
+        // 静默失效 — 窗口显示出来但不是 key window,所有 TextField
+        // 点不进光标("设置页输入框全部无法输入"的根因)。字幕浮窗是
+        // .nonactivatingPanel,从它的齿轮打开设置时 app 恰好总是未激活,
+        // 旧顺序(先 makeKey 后 activate)必现。
         if let win = settingsWindow, win.isVisible {
-            win.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            win.makeKeyAndOrderFront(nil)
+            Self.ensureKeyAfterActivation(win)
             return
         }
         guard let controller = windowController else { return }
@@ -391,8 +396,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.contentView = hosting
         win.isReleasedWhenClosed = false
         win.center()
-        win.makeKeyAndOrderFront(nil)
+        // 先 activate 再 makeKey(理由见 openSettings 开头注释)
         NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+        Self.ensureKeyAfterActivation(win)
         settingsWindow = win
 
         // 关掉窗口时把 settingsWindow 设回 nil，下次 openSettings() 就
@@ -403,6 +410,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.settingsWindow = nil
         }
         cleaner.install()
+    }
+
+    /// 协作式激活是**异步批准**的 — activate 请求发出的同一 runloop 里
+    /// makeKey 可能仍被拒。下一个 runloop 周期补一次,覆盖批准落地的
+    /// 窗口期(设置窗仍不是 key 就再 makeKey 一次)。
+    @MainActor
+    private static func ensureKeyAfterActivation(_ win: NSWindow) {
+        DispatchQueue.main.async { [weak win] in
+            guard let win, win.isVisible, !win.isKeyWindow else { return }
+            win.makeKeyAndOrderFront(nil)
+        }
     }
 
     // MARK: - Lifecycle

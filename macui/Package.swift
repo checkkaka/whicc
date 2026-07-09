@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "whicc-macui",
     defaultLocalization: "zh-Hans",
-    platforms: [.macOS("26.0")],
+    platforms: [.macOS("15.0")],
     targets: [
         .executableTarget(
             name: "whicc-macui",

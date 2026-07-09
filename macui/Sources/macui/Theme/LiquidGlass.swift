@@ -4,23 +4,32 @@ import SwiftUI
 //
 // A self-contained view modifier that produces the macOS 26 Liquid Glass
 // "floating plate" look. The plate is the chrome that hosts HUD
-// controls. We use `GlassEffectContainer` to coalesce neighbouring glass
-// shapes for performance and morphing, and an explicit `ultraThinMaterial`
-// underneath for the universal fallback.
+// controls. On macOS 26+ we use `GlassEffectContainer` to coalesce
+// neighbouring glass shapes for performance and morphing; on macOS 15
+// the same `ultraThinMaterial` + tint stack renders directly (frosted
+// material, no liquid morphing).
 
 struct GlassPlate: ViewModifier {
     var corner: CGFloat = Palette.hudCorner
 
+    private var plateFill: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: corner, style: .continuous)
+                .fill(.ultraThinMaterial)
+            RoundedRectangle(cornerRadius: corner, style: .continuous)
+                .fill(Palette.plateTint)
+        }
+    }
+
     func body(content: Content) -> some View {
         content
             .background {
-                GlassEffectContainer(spacing: 0) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: corner, style: .continuous)
-                            .fill(.ultraThinMaterial)
-                        RoundedRectangle(cornerRadius: corner, style: .continuous)
-                            .fill(Palette.plateTint)
+                if #available(macOS 26.0, *) {
+                    GlassEffectContainer(spacing: 0) {
+                        plateFill
                     }
+                } else {
+                    plateFill
                 }
             }
             .overlay {

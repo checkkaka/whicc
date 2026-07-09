@@ -659,7 +659,7 @@ def _load_state(path: str) -> dict:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"byte_offset": 0, "processed_keys": [], "failed_keys": []}
+        return {"byte_offset": 0}
 
 
 def _save_state(path: str, state: dict):
@@ -768,7 +768,7 @@ def main():
         print(f"[translate] translation_enabled=False,翻译未启用,退出", flush=True)
         print(f"[translate] 请在 macui 设置 → 服务配置 → 启用远端翻译,"
               f"并配置翻译节点地址", flush=True)
-        sys.exit(1)
+        sys.exit(3)  # 3 = 等配置(非故障),BackendLauncher 监控按 code 区分提示
     if args.force_enable and not translation_enabled:
         print(f"[translate] --force-enable 覆盖 lang_config.json 的 enabled=False,"
               f"继续启动 (打包模式 .app 行为)", flush=True)
@@ -828,7 +828,10 @@ def main():
     if not candidates:
         print(f"[translate] 未配置任何翻译节点 URL (translation_url / "
               f"translation_fallback_url / --vllm-url / --vllm-fallback-url),退出", flush=True)
-        sys.exit(1)
+        # exit 3 = 等配置,不是故障。用户在设置页填好地址(lang_config
+        # 保存)后,BackendLauncher 监控检测到配置文件更新会立即重启
+        # 本进程,新 URL 生效 — 用户不用手动"保存并重启"。
+        sys.exit(3)
 
     # per-URL model_map: fallback URL 用 fb_model_id (可能跟主 URL 不同)
     # 主 URL 用 model_id (fallback map 里没写)。backend 内部 _resolve_ipv4
@@ -840,33 +843,68 @@ def main():
         # CLI fallback (外部脚本可能传) 用配置的 fb model — 也算"本机"
         model_map[cli_fb] = fb_model_id
 
-    # 探活一次让用户立刻看到状态;失败就退出 — 比让进程空转报错更友好
-    try:
-        HyMT2Translator(vllm_url=candidates, model_id=model_id,
-                        model_map=model_map,
-                        glossary_path=args.glossary,
-                        max_new_tokens=args.max_new_tokens)
-        print(f"[translate] 已连接翻译服务,候选: {candidates}", flush=True)
-    except Exception as e:
-        print(f"[translate] 所有候选翻译节点都不可达: {e}", flush=True)
-        sys.exit(1)
+    # per-URL API key: 主/备节点各自的鉴权 key(macui 设置页配,可空)。
+    # 非空时该 URL 的所有请求(探活 + 翻译)带 Authorization: Bearer 头。
+    api_key_map: dict[str, str] = {}
+    main_api_key = (lang_cfg.get("translation_api_key") or "").strip()
+    fb_api_key = (lang_cfg.get("translation_fallback_api_key") or "").strip()
+    if vllm_url and main_api_key:
+        api_key_map[vllm_url] = main_api_key
+    if configured_fb and fb_api_key:
+        api_key_map[configured_fb] = fb_api_key
+    if cli_fb and cli_fb != configured_fb and fb_api_key:
+        api_key_map[cli_fb] = fb_api_key
+    if api_key_map:
+        print(f"[translate] 已配置 API key ({len(api_key_map)} 个节点)", flush=True)
 
-    translator = HyMT2Translator(
-        model_id=model_id,
-        vllm_url=candidates,
-        model_map=model_map,
-        glossary_path=args.glossary,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        repetition_penalty=args.repetition_penalty,
-        max_new_tokens=args.max_new_tokens,
-    )
+    # 请求端点: auto(默认,404 自适应) / chat(/v1/chat/completions) /
+    # responses(/v1/responses — GPT 系列流式端点,一些站点只提供它)
+    endpoint = (lang_cfg.get("translation_endpoint") or "auto").strip().lower()
+    if endpoint not in ("auto", "chat", "responses"):
+        print(f"[translate] 未知 translation_endpoint '{endpoint}',回退 auto", flush=True)
+        endpoint = "auto"
+    print(f"[translate] 翻译请求端点: {endpoint}", flush=True)
+
+    # __init__ 内部就做健康探活,失败抛异常(早期版本先建一个丢弃的实例
+    # 探活再建正式的,启动时白跑两次 GET /v1/models,已合并)。
+    #
+    # 节点全不可达**不再退出** — 之前 sys.exit(1) 意味着用户后开
+    # LM Studio 也没用,必须手动"保存并重启"。改为等待模式:每 15s
+    # 重试,期间字幕照常显示原文(事件跳过不积压),连上自动恢复。
+    # --once(离线评估)保留立即退出:评估跑批不该空等。
+    def _try_build_translator():
+        try:
+            t = HyMT2Translator(
+                model_id=model_id,
+                vllm_url=candidates,
+                model_map=model_map,
+                glossary_path=args.glossary,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                repetition_penalty=args.repetition_penalty,
+                max_new_tokens=args.max_new_tokens,
+                api_key_map=api_key_map,
+                endpoint=endpoint,
+            )
+            print(f"[translate] 已连接翻译服务,候选: {candidates}", flush=True)
+            return t
+        except Exception as e:
+            print(f"[translate] 翻译节点暂不可达: {e}", flush=True)
+            return None
+
+    TRANSLATOR_RETRY_SEC = 15.0
+    translator = _try_build_translator()
+    last_translator_retry = time.monotonic()
+    if translator is None:
+        if args.once:
+            print("[translate] --once 模式且节点不可达,退出", flush=True)
+            sys.exit(1)
+        print(f"[translate] 进入等待模式:每 {TRANSLATOR_RETRY_SEC:.0f}s 重试,"
+              f"字幕先显示原文,翻译服务可达后自动恢复", flush=True)
 
     state = _load_state(state_path)
     byte_offset = state.get("byte_offset", 0)
-    processed_keys: set[str] = set(state.get("processed_keys", []))
-    failed_keys: set[str] = set(state.get("failed_keys", []))
     pending_partial_line = state.get("pending_partial_line", "")
 
     f_trans = open(trans_events_path, "a", encoding="utf-8")
@@ -896,19 +934,27 @@ def main():
     partial_cache: dict[str, tuple[str, str]] = {}
 
     worker = None
-    if is_partial_mode:
-        worker = TranslateWorker(
-            translator, trans_state, partial_cache,
-            f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode,
-        )
-        worker.start()
-        print("[translate] 同声传译模式（增量翻译 + 异步线程）", flush=True)
+
+    def _start_worker():
+        """partial 模式的异步翻译线程。translator 就绪时才建 —
+        等待模式下重连成功后由主循环补建。"""
+        nonlocal worker
+        if is_partial_mode and worker is None and translator is not None:
+            worker = TranslateWorker(
+                translator, trans_state, partial_cache,
+                f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode,
+            )
+            worker.start()
+            print("[translate] 同声传译模式（增量翻译 + 异步线程）", flush=True)
+
+    _start_worker()
 
     def _flush_state():
+        # 注: 早期版本还持久化 processed_keys/failed_keys 两个集合,但去重
+        # 逻辑已改走 partial_cache,它们只增不读、每次全量序列化 — 长会话
+        # 内存与磁盘 IO 无限上涨,已删除。旧 state 文件里的多余键被忽略。
         _save_state(state_path, {
             "byte_offset": byte_offset,
-            "processed_keys": list(processed_keys),
-            "failed_keys": list(failed_keys),
             "pending_partial_line": pending_partial_line,
         })
 
@@ -933,8 +979,6 @@ def main():
             f_bi.flush()
 
     print(f"[translate] 开始消费 {args.events} (offset={byte_offset})", flush=True)
-    if processed_keys:
-        print(f"[translate] 已处理 {len(processed_keys)} 条，跳过", flush=True)
 
     # ── 词库热加载 ──
     _glossary_path = args.glossary
@@ -946,6 +990,8 @@ def main():
 
     def _try_reload_glossary():
         nonlocal _last_glossary_mtime, _glossary_check_counter
+        if translator is None:
+            return  # 等待模式:重连成功后 mtime 会被重置强制重灌
         _glossary_check_counter += 1
         if _glossary_check_counter % 200 != 0:  # 每 200 次循环检查一次
             return
@@ -978,7 +1024,9 @@ def main():
     _event_glossary_check_counter = 0
     _last_event_scene_mtime = 0.0
     _event_scene_check_counter = 0
-    _base_glossary = dict(translator.glossary)  # 保存永久词库快照
+    # 保存永久词库快照(等待模式下 translator 为 None,先空着 —
+    # 重连成功时主循环会重新初始化并强制重灌词库)
+    _base_glossary = dict(translator.glossary) if translator is not None else {}
     _event_active = False  # 当前是否有活跃事件
     _lang_check_counter = 0
 
@@ -1011,6 +1059,8 @@ def main():
     # ── 临时事件词库合并 ──
     def _merge_event_glossary():
         """将 event_glossary 合并到 _base_glossary 上，不修改 _base_glossary。"""
+        if translator is None:
+            return  # 等待模式:重连后强制重灌时再合并
         event_gloss = {}
         try:
             with open(event_glossary_path, "r", encoding="utf-8") as ef:
@@ -1035,6 +1085,8 @@ def main():
     # ── 临时事件词库热重载 ──
     def _try_reload_event_glossary():
         nonlocal _last_event_glossary_mtime, _event_glossary_check_counter
+        if translator is None:
+            return  # 等待模式:重连后 mtime 重置强制重灌
         _event_glossary_check_counter += 1
         if _event_glossary_check_counter % 200 != 0:
             return
@@ -1055,6 +1107,8 @@ def main():
     # ── 临时事件场景热重载 ──
     def _try_reload_event_scene():
         nonlocal _last_event_scene_mtime, _event_scene_check_counter, _event_active
+        if translator is None:
+            return  # 等待模式:重连后 mtime 重置强制重灌
         _event_scene_check_counter += 1
         if _event_scene_check_counter % 200 != 0:
             return
@@ -1103,6 +1157,18 @@ def main():
 
     try:
         while True:
+            # 等待模式:翻译服务不可达时限频重连,连上自动恢复(重灌
+            # 词库 + 补建 worker),用户不用"保存并重启"。
+            if translator is None and \
+                    time.monotonic() - last_translator_retry >= TRANSLATOR_RETRY_SEC:
+                last_translator_retry = time.monotonic()
+                translator = _try_build_translator()
+                if translator is not None:
+                    _base_glossary = dict(translator.glossary)
+                    _last_glossary_mtime = 0.0        # 强制重灌词库
+                    _last_event_glossary_mtime = 0.0  # 强制重灌事件词库
+                    _start_worker()
+
             _try_reload_glossary()
             _try_reload_lang()
             _try_reload_event_glossary()
@@ -1123,7 +1189,7 @@ def main():
                       f"resetting offset", flush=True)
                 byte_offset = 0
                 # 也清空 saved state 里的旧 offset,持久层也跟上
-                _save_state(processed_keys=None, failed_keys=None)
+                _flush_state()
             elif fsize == byte_offset:
                 if args.once:
                     break
@@ -1154,6 +1220,12 @@ def main():
 
                 etype = event.get("event_type")
 
+                # 等待模式:服务不可达期间跳过事件(offset 照常推进,不
+                # 积压 — 实时字幕翻旧内容没有意义),字幕区继续显示
+                # ASR 原文 draft。
+                if translator is None:
+                    continue
+
                 # ── partial 事件（partial 模式，异步翻译 + 显示）──
                 if is_partial_mode and etype == "partial":
                     key = _source_key(event)
@@ -1177,13 +1249,11 @@ def main():
 
                 source_text = event.get("text", "").strip()
                 if not source_text:
-                    processed_keys.add(key)
                     continue
 
                 if is_partial_mode and worker is not None:
                     # 异步：dispatch 给 worker，worker 内部做 classify + translate
                     worker.dispatch_final(event, source_text, key)
-                    processed_keys.add(key)
                 else:
                     # 同步：主线程做 classify + translate + write
                     update_info = trans_state.classify(source_text)
@@ -1191,15 +1261,12 @@ def main():
                         translator, source_text, update_info, event, counts,
                     )
                     if out_event and out_event.get("event_type") == "translation_error":
-                        failed_keys.add(key)
                         with out_lock:
                             f_trans.write(json.dumps(out_event, ensure_ascii=False) + "\n")
                             f_trans.flush()
                         _flush_state()
                         continue
                     _write_output(event, out_event)
-                    processed_keys.add(key)
-                    failed_keys.discard(key)
 
             byte_offset = new_byte_offset
             _flush_state()

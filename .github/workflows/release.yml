@@ -47,10 +47,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- Install Xcode 26 (project uses macOS 26 SwiftUI APIs like
-      # GlassEffectContainer that don't exist in Xcode 16's macOS 15.5 SDK).
-      # macos-15 image ships with Xcode 16.4 by default; without this
-      # step, xcodebuild picks up Xcode 16 → compile errors. ----
+      # ---- Install Xcode 26: compile against the macOS 26 SDK so the
+      # `if #available(macOS 26.0, *)` Liquid Glass branch
+      # (GlassEffectContainer) compiles, while
+      # MACOSX_DEPLOYMENT_TARGET=15.0 keeps the app runnable on
+      # macOS 15. macos-15 image ships Xcode 16.4 (macOS 15.5 SDK,
+      # lacks the symbol) by default → compile errors without this. ----
       - name: Setup Xcode 26
         uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -113,19 +115,21 @@ jobs:
       # ---- Python deps (used by xcodegen preBuildScripts that embed backend) ----
       # Same setup as ci.yml — fresh VM each run, recreate venv-standalone.
       #
-      # IMPORTANT: 必须用绝对路径调系统 Python.framework 的 python3.13,
-      # 否则 venv wrapper 会硬编码 homebrew python@3.13.14 路径,
-      # 用户机没装 homebrew 时 dyld fail → ASR 失效。详细原因见 ci.yml
-      # 注释。SOP.md §Troubleshooting 同步记录了这条踩坑。
-      - name: Setup Python 3.13 venv
+      # IMPORTANT: 必须用 python-build-standalone(自包含解释器),不能用
+      # `python3 -m venv`。任何基于本机 Python 的 venv(homebrew 或
+      # python.org framework)都会让内嵌 python3 dyld 链接用户机上不存在
+      # 的绝对路径 → 后端全灭无字幕。详见 ci.yml 注释与 DEVELOPMENT.md
+      # "一次性 setup"。SOP.md §Troubleshooting 同步记录了这条踩坑。
+      - name: Setup standalone Python 3.13 (self-contained)
         run: |
-          SYSTEM_PYTHON="/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
-          "$SYSTEM_PYTHON" -m venv /tmp/whicc-venv
-          /tmp/whicc-venv/bin/pip install --upgrade pip wheel
-          /tmp/whicc-venv/bin/pip install -r requirements.txt
-
-      - name: Symlink venv-standalone for build script
-        run: ln -sfn /tmp/whicc-venv venv-standalone
+          curl -sL -o /tmp/cpython-standalone.tar.gz \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.13.14+20260610-aarch64-apple-darwin-install_only_stripped.tar.gz"
+          mkdir -p /tmp/python-standalone
+          tar -xzf /tmp/cpython-standalone.tar.gz -C /tmp/python-standalone
+          mkdir -p venv-standalone
+          cp -R /tmp/python-standalone/python/* venv-standalone/
+          ./venv-standalone/bin/python3.13 -m ensurepip
+          ./venv-standalone/bin/pip install --no-cache-dir -r requirements.txt
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -173,6 +177,37 @@ jobs:
             || (echo "✗ executable missing"; exit 1)
           # Confirm .lproj is bundled (CI lint passed earlier, but be paranoid)
           ls build/Build/Products/Release/whicc.app/Contents/Resources/en.lproj/Localizable.strings
+
+      # ---- Self-containment + macOS 15 compat guard (same as ci.yml) ----
+      # A release that fails these is exactly the "打不开/没字幕" bug
+      # family we shipped before — hard-fail rather than publish.
+      - name: Verify embedded Python is self-contained + macOS 15 compatible
+        run: |
+          set -euo pipefail
+          APP=build/Build/Products/Release/whicc.app
+          PY="$APP/Contents/Resources/venv/bin/python3"
+          test -f "$PY" || { echo "✗ embedded python3 missing"; exit 1; }
+          if otool -L "$PY" | grep -E "/Library/Frameworks/Python|/opt/homebrew"; then
+            echo "✗ embedded python3 links a machine-specific framework (not self-contained)"
+            exit 1
+          fi
+          echo "✓ embedded python3 is self-contained"
+          BAD=0
+          for lib in $(find "$APP/Contents/Resources/venv/lib" \
+                        \( -name "*.so" -o -name "*.dylib" \) -path "*mlx*"); do
+            MINOS=$(otool -l "$lib" 2>/dev/null \
+                    | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+            case "$MINOS" in
+              16.*|2[0-9].*) echo "✗ $lib minos=$MINOS (needs > macOS 15)"; BAD=1 ;;
+            esac
+          done
+          if [ "$BAD" != 0 ]; then exit 1; fi
+          echo "✓ mlx native libraries load on macOS 15"
+          # App binary itself must target 15.0
+          MAIN_MINOS=$(otool -l "$APP/Contents/MacOS/whicc" \
+                    | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+          echo "app binary minos=$MAIN_MINOS"
+          [ "$MAIN_MINOS" = "15.0" ] || { echo "✗ expected minos 15.0"; exit 1; }
 
       # ---- Build .dmg for distribution ----
       # bin/build_dmg.sh wraps the hdiutil dance: create UDRW → mount →

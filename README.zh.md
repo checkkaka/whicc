@@ -4,7 +4,7 @@
 > 语言识别模型 + 翻译模型 = 全球多语种实时翻译字幕
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform: macOS 26+](https://img.shields.io/badge/Platform-macOS%2026%2B-blue.svg)](https://developer.apple.com/macos/)
+[![Platform: macOS 15+](https://img.shields.io/badge/Platform-macOS%2015%2B-blue.svg)](https://developer.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4%2FM5-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
@@ -53,7 +53,7 @@
 - **🖥️ 纯本地算力ASR和翻译 ** — Nemotron-3.5-ASR (非中文) + Qwen3-ASR (中文) 在 Apple Silicon (MLX) 上跑。**音频不出本机**,不依赖任何云端转写服务。
 - **🌐 覆盖大多数语言** — 翻译后端用 Tencent Hy-MT2,支持中/英/日/德/法/西/俄/韩/阿/葡/意 等几十种语言任意互译,小语种也兜得住。
 - **🔌 翻译服务由你提供** — whicc 自己不带翻译模型,你需要装 [LM Studio](https://lmstudio.ai/) 加载翻译模型(可以是本机 Mac、家里 Windows、局域网任何机器)。模型越大,翻译越好。
-- **🪟 SwiftUI 浮岛字幕** — macOS 26 Liquid Glass 浮窗,自动隐藏/唤起,中英文自动切换。
+- **🪟 SwiftUI 浮岛字幕** — 浮窗自动隐藏/唤起,中英文自动切换。macOS 26 上是 Liquid Glass 液态玻璃,macOS 15 上退化为系统磨砂材质。
 - **🤖 自学习术语库** — jieba 关键词抽取 + 场景检测 + Hermes Agent 术语搜索,术语自动沉淀到 glossary.json,下次翻译自动应用。
 - **📈 模型越好它越好，世界越好它越好** — ASR 模型 / 翻译模型任一侧升级,whicc 字幕质量跟着提升。
 
@@ -63,7 +63,7 @@
 
 | 类型 | 要求 |
 |---|---|
-| OS | **macOS 26+** (MLX wheel 硬绑定 `macosx_26_0_arm64`) |
+| OS | **macOS 15+** (mlx 官方 wheel 提供 `macosx_15_0_arm64`;macOS 26 上有完整 Liquid Glass 视觉) |
 | 芯片 | **Apple Silicon** (M1 / M2 / M3 / M4 / M5) |
 | 磁盘 | 首次启动设置页下载 ASR 模型,约 **2 GB** |
 | Python | 3.13 (用于源码开发模式,普通用户用 .app 无需) |
@@ -179,7 +179,7 @@ macui 工具栏语言选择器实时切换,**无需重启**。
 - **自动隐藏**: 非焦点/非 hover 时整组 `opacity(0)` 不响应点击
 - **双语字幕**: 现场切换"原文上 / 译文上"
 - **7 个 accent 主题**: White / Ice / Gold / Neon / Coral / Violet / Cyan
-- **液态玻璃**: macOS 26 SwiftUI `GlassEffectContainer`
+- **液态玻璃**: macOS 26 上用 SwiftUI `GlassEffectContainer`,macOS 15 上退化为 `ultraThinMaterial` 磨砂兜底
 - **中英文自动切换 ASR**: 标题栏左侧显示当前模型,3 秒自动消失
 
 ---

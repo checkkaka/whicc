@@ -3,7 +3,7 @@
 > **ASR model + translation model = real-time multilingual subtitle for any video.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform: macOS 26+](https://img.shields.io/badge/Platform-macOS%2026%2B-blue.svg)](https://developer.apple.com/macos/)
+[![Platform: macOS 15+](https://img.shields.io/badge/Platform-macOS%2015%2B-blue.svg)](https://developer.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4%2FM5-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
@@ -52,7 +52,7 @@ If you're studying abroad or in a foreign-language class, switch to microphone m
 - **🖥️ Local ASR, end-to-end** — Nemotron-3.5-ASR (non-Chinese) + Qwen3-ASR (Chinese) running on Apple Silicon via MLX. **Audio never leaves your machine**, no cloud transcription service required.
 - **🌐 Most languages covered** — The translation backend uses Tencent Hy-MT2, supporting dozens of languages in any combination (Chinese, English, Japanese, German, French, Spanish, Russian, Korean, Arabic, Portuguese, Italian, and more).
 - **🔌 You bring the translation model** — whicc doesn't ship a translation model. You install [LM Studio](https://lmstudio.ai/) and load a translation model (on this Mac, a Windows PC on your home network, or any machine with network access). The bigger the model, the better the translation.
-- **🪟 SwiftUI floating subtitle** — A macOS 26 Liquid Glass panel that auto-hides when not focused, switches target/source layout on the fly.
+- **🪟 SwiftUI floating subtitle** — A floating panel that auto-hides when not focused and switches target/source layout on the fly. Liquid Glass on macOS 26, frosted material fallback on macOS 15.
 - **🤖 Self-learning glossary** — jieba keyword extraction + scene detection + Hermes Agent terminology search. Terms accumulate in `glossary.json` and apply automatically next session.
 - **📈 It gets better with the models** — Upgrade either the ASR or the translation model and whicc's quality follows.
 
@@ -62,7 +62,7 @@ If you're studying abroad or in a foreign-language class, switch to microphone m
 
 | Type | Requirement |
 |---|---|
-| OS | **macOS 26+** (MLX wheel hard-binds to `macosx_26_0_arm64`) |
+| OS | **macOS 15+** (official mlx wheels ship `macosx_15_0_arm64`; full Liquid Glass visuals on macOS 26) |
 | Chip | **Apple Silicon** (M1 / M2 / M3 / M4 / M5) |
 | Disk | First-launch model download ≈ **2 GB** |
 | Python | 3.13 (only for source-build development; not needed when using the .app) |
@@ -178,7 +178,7 @@ Fill in a scene description in Settings (e.g. `AI interview` / `NBA Finals`) to 
 - **Auto-hide**: `opacity(0)` and click-through when the cursor isn't over it
 - **Bilingual subtitle**: switch source-on-top / translation-on-top live
 - **7 accent themes**: White / Ice / Gold / Neon / Coral / Violet / Cyan
-- **Liquid Glass**: macOS 26 SwiftUI `GlassEffectContainer`
+- **Liquid Glass**: SwiftUI `GlassEffectContainer` on macOS 26, `ultraThinMaterial` frosted fallback on macOS 15
 - **Auto-switching ASR**: current model name flashes in the title bar for 3 seconds when it changes
 
 ---

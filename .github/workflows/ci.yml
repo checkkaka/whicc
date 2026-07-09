@@ -5,9 +5,9 @@
 #   2. plutil -lint on every .lproj/Localizable.strings (catch missing semicolons / broken quotes)
 #   3. Python key check: every key in any *.lproj must match a Chinese literal in source
 #
-# venv-standalone is .gitignored, so CI just installs deps fresh each run:
-#   python3.13 -m venv /tmp/whicc-venv
-#   /tmp/whicc-venv/bin/pip install -r requirements.txt
+# venv-standalone is .gitignored, so CI just installs deps fresh each run
+# from python-build-standalone (self-contained interpreter, see
+# DEVELOPMENT.md "一次性 setup") + pip install -r requirements.txt.
 #
 # This is the minimum bar for open-source PR review — without it, contributors
 # can't tell whether their i18n PR actually broke en locale before maintainer
@@ -38,11 +38,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- Install Xcode 26 (project uses macOS 26 SwiftUI APIs like
-      # GlassEffectContainer that don't exist in Xcode 16). Without
-      # this step, builds fail with "cannot find 'GlassEffectContainer'
-      # in scope" against the default Xcode 16 SDK that ships with
-      # macos-15 image. ----
+      # ---- Install Xcode 26: we compile against the macOS 26 SDK so the
+      # `if #available(macOS 26.0, *)` Liquid Glass branch
+      # (GlassEffectContainer) can be compiled in, while
+      # MACOSX_DEPLOYMENT_TARGET=15.0 keeps the app runnable on
+      # macOS 15. Xcode 16's macOS 15.5 SDK lacks the symbol → build
+      # fails without this step. ----
       - name: Setup Xcode 26
         uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -59,22 +60,24 @@ jobs:
       # to copy Python into the .app bundle. CI re-creates venv-standalone
       # from requirements.txt so we don't ship a 1.3GB binary in git.
       #
-      # IMPORTANT: 必须用绝对路径调系统 Python.framework 的 python3.13。
-      # `python3.13 -m venv` 依赖 $PATH 解析,macos-15 runner 上一步
-      # `brew install xcodegen` 会把 /opt/homebrew/bin 推到 PATH 顶部,
-      # 结果 `python3.13` 解析到 homebrew python@3.13.14 → venv wrapper
-      # 硬编码 /opt/homebrew/Cellar/python@3.13/3.13.14/...Python。
-      # 装到用户机后,用户没装 homebrew 3.13.14 → dyld fail → ASR 失效。
-      # 用 framework 路径绑死 system Python (3.13.5),所有机器都装。
-      - name: Setup Python 3.13 venv
+      # IMPORTANT: 必须用 python-build-standalone(自包含解释器,相对
+      # install name),不能用 `python3 -m venv`。任何基于本机 Python 的
+      # venv(homebrew 的 /opt/homebrew/Cellar/... 或 python.org 的
+      # /Library/Frameworks/Python.framework/...)都会让内嵌 python3
+      # dyld 链接一条用户机上不存在的绝对路径 → 后端全灭无字幕。
+      # 见 DEVELOPMENT.md "一次性 setup" 与其中的 ⚠️ 警告。
+      # 另外:在 macos-15 runner 上 pip 会选 macosx_15_0_arm64 的 mlx
+      # wheel,保证产物能跑在 macOS 15(有 build 后校验步骤兜底)。
+      - name: Setup standalone Python 3.13 (self-contained)
         run: |
-          SYSTEM_PYTHON="/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
-          "$SYSTEM_PYTHON" -m venv /tmp/whicc-venv
-          /tmp/whicc-venv/bin/pip install --upgrade pip wheel
-          /tmp/whicc-venv/bin/pip install -r requirements.txt
-
-      - name: Symlink venv-standalone for build script
-        run: ln -sfn /tmp/whicc-venv venv-standalone
+          curl -sL -o /tmp/cpython-standalone.tar.gz \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.13.14+20260610-aarch64-apple-darwin-install_only_stripped.tar.gz"
+          mkdir -p /tmp/python-standalone
+          tar -xzf /tmp/cpython-standalone.tar.gz -C /tmp/python-standalone
+          mkdir -p venv-standalone
+          cp -R /tmp/python-standalone/python/* venv-standalone/
+          ./venv-standalone/bin/python3.13 -m ensurepip
+          ./venv-standalone/bin/pip install --no-cache-dir -r requirements.txt
 
       # ---- xcodegen: regenerate whicc.xcodeproj from project.yml ----
       # .xcodeproj is .gitignored (each dev regenerates locally), so CI runs
@@ -94,6 +97,35 @@ jobs:
             -configuration Release \
             -derivedDataPath build \
             clean build
+
+      # ---- Self-containment + macOS 15 compat guard ----
+      # Regression guard for two shipped-broken failure modes:
+      # 1. embedded python3 dyld-linking a machine path (homebrew /
+      #    python.org framework) → backend dead on user machines;
+      # 2. a native wheel built for macOS 26 sneaking in → app dies
+      #    on macOS 15 despite MACOSX_DEPLOYMENT_TARGET=15.0.
+      - name: Verify embedded Python is self-contained + macOS 15 compatible
+        run: |
+          set -euo pipefail
+          APP=build/Build/Products/Release/whicc.app
+          PY="$APP/Contents/Resources/venv/bin/python3"
+          test -f "$PY" || { echo "✗ embedded python3 missing"; exit 1; }
+          if otool -L "$PY" | grep -E "/Library/Frameworks/Python|/opt/homebrew"; then
+            echo "✗ embedded python3 links a machine-specific framework (not self-contained)"
+            exit 1
+          fi
+          echo "✓ embedded python3 is self-contained"
+          BAD=0
+          for lib in $(find "$APP/Contents/Resources/venv/lib" \
+                        \( -name "*.so" -o -name "*.dylib" \) -path "*mlx*"); do
+            MINOS=$(otool -l "$lib" 2>/dev/null \
+                    | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+            case "$MINOS" in
+              16.*|2[0-9].*) echo "✗ $lib minos=$MINOS (needs > macOS 15)"; BAD=1 ;;
+            esac
+          done
+          if [ "$BAD" != 0 ]; then exit 1; fi
+          echo "✓ mlx native libraries load on macOS 15"
 
       # ---- i18n lint: every .lproj/Localizable.strings must parse ----
       # Catches: missing semicolons, broken quotes, encoding issues. The

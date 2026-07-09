@@ -32,6 +32,22 @@ final class LangConfig: ObservableObject {
     /// 开 = 走远端 vLLM / LM Studio HTTP 后端。默认关 — 用户必须
     /// 显式开,即使填了 URL 也不自动启用。改完需重启 translate_stream 生效。
     @Published var translationEnabled: Bool = false
+    /// 外置翻译节点的 API key — 非空时所有请求(/v1/models 探活 +
+    /// /v1/chat/completions)都带 `Authorization: Bearer <key>` 头。
+    /// 空 = 不发鉴权头(LM Studio 本机裸跑的常态)。明文存
+    /// lang_config.json(Python 端要读;文件在本机 /tmp,与项目现有
+    /// 配置同级别的安全假设)。改完需重启 translate_stream 生效。
+    @Published var translationApiKey: String = ""
+    /// 本机回退节点的 API key,语义同 translationApiKey。
+    @Published var translationFallbackApiKey: String = ""
+    /// 翻译请求端点: "auto"(默认,404 自适应切换) / "chat"
+    /// (/v1/chat/completions) / "responses"(/v1/responses — GPT 系列
+    /// 流式端点,一些站点只提供它)。改完需重启 translate_stream 生效。
+    @Published var translationEndpoint: String = "auto"
+    /// 模型下载加速:开启后 model_downloader / whicc.py 的 HF 下载走
+    /// hf-mirror.com 镜像。直连 huggingface.co 缓慢/受限的网络环境
+    /// 开这个;海外网络保持关闭(直连更快)。下一次下载即生效。
+    @Published var hfMirrorEnabled: Bool = false
     @Published var hermesHost: String = ""
     /// Subtitle font choice — persisted but owned by `OverlayState`
     /// (UI binds to `state.fontChoice`). `LangConfig` just stores the
@@ -93,6 +109,12 @@ final class LangConfig: ObservableObject {
     private var fileWatcher: DispatchSourceFileSystemObject?
     private var retryWatchWorkItem: DispatchWorkItem?
     private var fd: Int32 = -1
+    /// save() 最近写入的序列化内容。load() 读到与之相同的字节时说明
+    /// 这是**自己写入的回流**(atomic 写 → rename → 文件监视器触发),
+    /// 直接跳过 — 否则每次保存都会整批重设 @Published,把用户正在
+    /// 输入框里编辑的草稿覆盖回磁盘旧值("地址打一半被吃字"的根因)。
+    /// Python 端写入的内容与指纹必然不同(键序/字段值),不会被误跳过。
+    private var lastWrittenData: Data?
 
     init(outDir: String = AppPaths.runDir) {
         self.configPath = "\(outDir)/lang_config.json"
@@ -179,6 +201,26 @@ final class LangConfig: ObservableObject {
         save()
     }
 
+    func setTranslationApiKey(_ key: String) {
+        translationApiKey = key
+        save()
+    }
+
+    func setTranslationFallbackApiKey(_ key: String) {
+        translationFallbackApiKey = key
+        save()
+    }
+
+    func setTranslationEndpoint(_ endpoint: String) {
+        translationEndpoint = endpoint
+        save()
+    }
+
+    func setHfMirrorEnabled(_ enabled: Bool) {
+        hfMirrorEnabled = enabled
+        save()
+    }
+
     func setHermesHost(_ host: String) {
         hermesHost = host
         save()
@@ -244,26 +286,57 @@ final class LangConfig: ObservableObject {
 
     // MARK: - Reachability
 
+    /// 规范化用户填写的服务地址,返回**不带 /v1** 的 base(调用方统一拼
+    /// "/v1/models" 等端点):
+    /// - 补 http:// 前缀(用户填 "127.0.0.1:1234")
+    /// - 去尾部斜杠(避免 //v1/models 双斜杠)
+    /// - **剥掉 /v1 后缀** — OpenAI SDK / LM Studio 界面惯用
+    ///   "http://host:port/v1" 形式,用户照抄很常见;不剥的话拼出
+    ///   /v1/v1/models → 404 → 被误判"服务不可达"。两种填法都工作。
+    static func normalizeServiceBase(_ raw: String) -> String {
+        var u = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if u.isEmpty { return u }
+        if !u.hasPrefix("http://") && !u.hasPrefix("https://") {
+            u = "http://" + u
+        }
+        while u.hasSuffix("/") { u = String(u.dropLast()) }
+        if u.lowercased().hasSuffix("/v1") {
+            u = String(u.dropLast(3))
+            while u.hasSuffix("/") { u = String(u.dropLast()) }
+        }
+        return u
+    }
+
+    /// 构造探活/拉模型列表请求 — key 非空时带 `Authorization: Bearer` 头
+    /// (OpenAI 兼容标准;vLLM --api-key / 各类网关都认这个头)。
+    /// 5s 超时:URLRequest 默认 60s,URL 指向不响应的地址(防火墙 DROP)
+    /// 时状态行会挂在"正在探测连通性"整整一分钟。
+    private static func authedRequest(_ url: URL, apiKey: String) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        if !apiKey.isEmpty {
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        return req
+    }
+
     func detectTranslation() {
         guard !translationUrl.isEmpty else {
             translationReachable = nil
             return
         }
-        // URL 规范化:
-        // - 自动加 http:// 前缀(用户填 "127.0.0.1:1234")
-        // - strip 末尾 /,避免拼成 //health / //v1/models 双斜杠 — LM Studio
-        //   对 //health 不会 404,但日志会刷 "Unexpected endpoint" 警告
         // 用 /v1/models 而不是 /health 探活: 跟 translator_hy_mt2.py 的
         // _check_health 保持一致 — LM Studio/vLLM/Ollama 都暴露
         // OpenAI 兼容的 /v1/models,且要求 data 非空 = 模型真的加载好了
-        // (/health 只测 server alive,刚启动还没加载模型时也返回 200)
-        let url = translationUrl.hasPrefix("http") ? translationUrl : "http://\(translationUrl)"
-        let normalizedUrl = url.hasSuffix("/") ? String(url.dropLast()) : url
-        guard let endpoint = URL(string: "\(normalizedUrl)/v1/models") else {
+        // (/health 只测 server alive,刚启动还没加载模型时也返回 200)。
+        // 地址规范化(补 http:// / 去尾斜杠 / 剥 /v1 后缀)统一走
+        // normalizeServiceBase — 防呆见其注释。
+        let base = Self.normalizeServiceBase(translationUrl)
+        guard let endpoint = URL(string: "\(base)/v1/models") else {
             translationReachable = false
             return
         }
-        URLSession.shared.dataTask(with: endpoint) { [weak self] _, resp, err in
+        URLSession.shared.dataTask(with: Self.authedRequest(endpoint, apiKey: translationApiKey)) { [weak self] _, resp, err in
             Task { @MainActor in
                 guard let self else { return }
                 let wasReachable = self.translationReachable
@@ -292,13 +365,13 @@ final class LangConfig: ObservableObject {
             remoteModelsFetched = nil
             return
         }
-        let base = translationUrl.hasPrefix("http") ? translationUrl : "http://\(translationUrl)"
+        let base = Self.normalizeServiceBase(translationUrl)
         guard let endpoint = URL(string: "\(base)/v1/models") else {
             remoteModels = []
             remoteModelsFetched = false
             return
         }
-        URLSession.shared.dataTask(with: endpoint) { [weak self] data, resp, err in
+        URLSession.shared.dataTask(with: Self.authedRequest(endpoint, apiKey: translationApiKey)) { [weak self] data, resp, err in
             Task { @MainActor in
                 guard let self else { return }
                 if err != nil || data == nil {
@@ -337,13 +410,13 @@ final class LangConfig: ObservableObject {
             remoteModelsFallbackFetched = nil
             return
         }
-        let base = translationFallbackUrl.hasPrefix("http") ? translationFallbackUrl : "http://\(translationFallbackUrl)"
+        let base = Self.normalizeServiceBase(translationFallbackUrl)
         guard let endpoint = URL(string: "\(base)/v1/models") else {
             remoteModelsFallback = []
             remoteModelsFallbackFetched = false
             return
         }
-        URLSession.shared.dataTask(with: endpoint) { [weak self] data, resp, err in
+        URLSession.shared.dataTask(with: Self.authedRequest(endpoint, apiKey: translationFallbackApiKey)) { [weak self] data, resp, err in
             Task { @MainActor in
                 guard let self else { return }
                 if err != nil || data == nil {
@@ -403,17 +476,14 @@ final class LangConfig: ObservableObject {
             translationFallbackReachable = nil
             return
         }
-        // 同样规范化:strip trailing /,探活走 /v1/models (跟 detectTranslation 同逻辑,
-        // 也跟 Python 端 translator_hy_mt2._check_health 一致)。
-        let url = translationFallbackUrl.hasPrefix("http")
-            ? translationFallbackUrl
-            : "http://\(translationFallbackUrl)"
-        let normalizedUrl = url.hasSuffix("/") ? String(url.dropLast()) : url
-        guard let endpoint = URL(string: "\(normalizedUrl)/v1/models") else {
+        // 同样规范化(补 http:// / 去尾斜杠 / 剥 /v1),探活走 /v1/models
+        // (跟 detectTranslation 同逻辑,也跟 Python 端 _check_health 一致)。
+        let base = Self.normalizeServiceBase(translationFallbackUrl)
+        guard let endpoint = URL(string: "\(base)/v1/models") else {
             translationFallbackReachable = false
             return
         }
-        URLSession.shared.dataTask(with: endpoint) { [weak self] _, resp, err in
+        URLSession.shared.dataTask(with: Self.authedRequest(endpoint, apiKey: translationFallbackApiKey)) { [weak self] _, resp, err in
             Task { @MainActor in
                 guard let self else { return }
                 let wasReachable = self.translationFallbackReachable
@@ -434,18 +504,31 @@ final class LangConfig: ObservableObject {
         guard let data = FileManager.default.contents(atPath: configPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         Task { @MainActor in
+            // 自回流守卫:内容与自己最近一次 save() 写入的完全一致 →
+            // 这次文件事件由我们自己触发,跳过,不去覆盖 @Published
+            // (用户可能正在输入框里打字)。
+            if data == self.lastWrittenData { return }
             if let lang = json["target_lang"] as? String { self.targetLang = lang }
             // 旧配置文件无 source_lang 键,默认 "auto" (跟 Python 端
             // 行为一致,让 ASR 自己检测)。不覆盖已经设置过的 target_lang。
             if let lang = json["source_lang"] as? String { self.sourceLang = lang }
-            self.translationUrl = (json["translation_url"] as? String) ?? ""
-            self.translationFallbackUrl = (json["translation_fallback_url"] as? String) ?? ""
-            self.translationModel = (json["translation_model"] as? String) ?? ""
-            self.translationFallbackModel = (json["translation_fallback_model"] as? String) ?? ""
+            // 文本输入字段:值真的变了才赋值 — 每次赋值都会 fire
+            // objectWillChange,触发输入框的外部同步逻辑,打断正在
+            // 进行的编辑。
+            self.assignIfChanged(\.translationUrl, (json["translation_url"] as? String) ?? "")
+            self.assignIfChanged(\.translationFallbackUrl, (json["translation_fallback_url"] as? String) ?? "")
+            self.assignIfChanged(\.translationModel, (json["translation_model"] as? String) ?? "")
+            self.assignIfChanged(\.translationFallbackModel, (json["translation_fallback_model"] as? String) ?? "")
+            self.assignIfChanged(\.translationApiKey, (json["translation_api_key"] as? String) ?? "")
+            self.assignIfChanged(\.translationFallbackApiKey, (json["translation_fallback_api_key"] as? String) ?? "")
+            if let ep = json["translation_endpoint"] as? String, !ep.isEmpty {
+                self.assignIfChanged(\.translationEndpoint, ep)
+            }
+            self.hfMirrorEnabled = (json["hf_mirror_enabled"] as? Bool) ?? false
             // 旧配置文件没有 translation_enabled 键,默认为关(纯本地)。
             // 这样老用户升级后行为不会突变。
             self.translationEnabled = (json["translation_enabled"] as? Bool) ?? false
-            self.hermesHost = (json["hermes_host"] as? String) ?? ""
+            self.assignIfChanged(\.hermesHost, (json["hermes_host"] as? String) ?? "")
             if let font = json["subtitle_font"] as? String { self.subtitleFont = font }
             if let fav = json["favorite_fonts"] as? [String] { self.favoriteFonts = fav }
             // audio_source: "system" | "mic"。旧配置无此键时默认 "system"。
@@ -479,6 +562,12 @@ final class LangConfig: ObservableObject {
         self.translationFallbackUrl = (json["translation_fallback_url"] as? String) ?? ""
         self.translationModel = (json["translation_model"] as? String) ?? ""
         self.translationFallbackModel = (json["translation_fallback_model"] as? String) ?? ""
+        self.translationApiKey = (json["translation_api_key"] as? String) ?? ""
+        self.translationFallbackApiKey = (json["translation_fallback_api_key"] as? String) ?? ""
+        if let ep = json["translation_endpoint"] as? String, !ep.isEmpty {
+            self.translationEndpoint = ep
+        }
+        self.hfMirrorEnabled = (json["hf_mirror_enabled"] as? Bool) ?? false
         self.translationEnabled = (json["translation_enabled"] as? Bool) ?? false
         self.hermesHost = (json["hermes_host"] as? String) ?? ""
         if let font = json["subtitle_font"] as? String { self.subtitleFont = font }
@@ -522,6 +611,10 @@ final class LangConfig: ObservableObject {
         json["translation_fallback_url"] = translationFallbackUrl
         json["translation_model"] = translationModel
         json["translation_fallback_model"] = translationFallbackModel
+        json["translation_api_key"] = translationApiKey
+        json["translation_fallback_api_key"] = translationFallbackApiKey
+        json["translation_endpoint"] = translationEndpoint
+        json["hf_mirror_enabled"] = hfMirrorEnabled
         json["translation_enabled"] = translationEnabled
         json["hermes_host"] = hermesHost
         json["subtitle_font"] = subtitleFont
@@ -547,8 +640,18 @@ final class LangConfig: ObservableObject {
         // 新文件，文件监视器在 .rename 后会重新 open 当前路径。
         do {
             try data.write(to: URL(fileURLWithPath: configPath), options: .atomic)
+            // 记录写入指纹 — load() 用它识别并跳过自己触发的回流。
+            lastWrittenData = data
         } catch {
             logSave("write failed: \(error)")
+        }
+    }
+
+    /// String 字段"变了才赋值"辅助 — 避免每次 load 都 fire @Published,
+    /// 触发输入框的外部同步逻辑打断编辑。
+    private func assignIfChanged(_ keyPath: ReferenceWritableKeyPath<LangConfig, String>, _ newValue: String) {
+        if self[keyPath: keyPath] != newValue {
+            self[keyPath: keyPath] = newValue
         }
     }
 

@@ -14,6 +14,7 @@ struct OpacitySlider: View {
                 .tint(Palette.textPrimary)
                 .frame(width: 72)
         }
+        .help("字幕窗口背景透明度")
         .hudControl()
     }
 }

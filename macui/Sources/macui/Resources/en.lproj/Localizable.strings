@@ -97,9 +97,23 @@
 "检测翻译回退节点" = "Test fallback node";
 "检测翻译节点" = "Test main node";
 "本机翻译服务地址，如Lm studio:http://127.0.0.1:1234" = "Local translation service address (e.g. LM Studio: http://127.0.0.1:1234)";
-"本机模型名称" = "Local model name";
+"本机模型名称（可手动输入）" = "Local model name (type manually or pick from list)";
 "外置算力翻译模型服务地址" = "External translation service address";
-"模型名称" = "Model name";
+"模型名称（可手动输入）" = "Model name (type manually or pick from list)";
+"本机 API key（可选）" = "Local API key (optional)";
+"外置 API key（可选）" = "External API key (optional)";
+"API key（可选，留空不鉴权）" = "API key (optional; empty = no auth)";
+"本机节点鉴权 key,改完自动重新探测" = "Auth key for the local node; re-probes automatically after edit";
+"外置节点鉴权 key,改完自动重新探测" = "Auth key for the external node; re-probes automatically after edit";
+"请求端点" = "Endpoint";
+"站点只提供 /v1/responses(GPT 系列)时选 Responses;不确定就留自动" = "Pick Responses if the site only offers /v1/responses (GPT series); leave on Auto when unsure";
+"自动检测" = "Auto";
+"Chat Completions（/v1/chat/completions）" = "Chat Completions (/v1/chat/completions)";
+"Responses（/v1/responses）" = "Responses (/v1/responses)";
+"如 hy-mt2-7b（可手动输入或从右侧列表选择）" = "e.g. hy-mt2-7b (type manually or pick from the list)";
+"下载加速（HF 镜像）" = "Download acceleration (HF mirror)";
+"切换后自动重启识别后端，数秒内生效" = "Recognition backend restarts automatically after switching; takes effect in seconds";
+"下载缓慢时开启，模型改走 hf-mirror.com；海外网络建议保持关闭" = "Enable when downloads are slow; models fetch via hf-mirror.com. Keep off on networks with fast direct access";
 "配置成功后，外置算力不可用时自动使用本地算力" = "After configuration, local fallback kicks in automatically when external fails";
 "保存并重启翻译服务" = "Save and restart translation service";
 "重启中…" = "Restarting…";
@@ -121,18 +135,18 @@
 /* Translation model dropdown */
 "请先填写翻译服务地址" = "Fill in the translation service address first";
 "拉取失败 — 重试" = "Fetch failed — retry";
-"正在获取模型…" = "Fetching models…";
-"正在获取模型列表…" = "Fetching model list…";
+"获取模型列表" = "Fetch model list";
 "未找到模型 — 重试" = "No models found — retry";
 "刷新列表" = "Refresh list";
-"选择模型" = "Select model";
+"站点不提供 /v1/models 时请直接在左侧输入模型名" = "If the site has no /v1/models, type the model name on the left";
+"该节点未通过 /v1/models 返回模型,请在左侧手动输入" = "No models returned via /v1/models; type the name on the left";
 
 /* Model dropdown help (note: full sentence, exact match required) */
-"请先在上方填写翻译服务地址,失焦后会自动拉取该节点的模型列表" = "Fill in the translation service address above first; the model list will be fetched automatically once focus leaves the field";
-"改完翻译服务地址后,失焦会自动拉取该节点的模型列表" = "After editing the translation service address, the model list for this node is fetched automatically on focus loss";
+"请先在上方填写翻译服务地址" = "Fill in the translation service address above first";
+"从该节点的 /v1/models 拉取可选模型列表;站点不提供该端点时直接手动输入" = "Fetch the model list from this node's /v1/models; type manually if the endpoint is unavailable";
 "该节点未通过 /v1/models 返回任何模型" = "This node did not return any models via /v1/models";
-"已从外接翻译服务加载 " = "Loaded ";
-" 个模型,点击切换" = " models from external service; click to switch";
+"已加载 " = "Loaded ";
+" 个模型,点击选择" = " models; click to pick";
 
 /* Language section (in ServerPane) */
 "语言" = "Language";
@@ -165,7 +179,6 @@
 "（未设置）" = "(not set)";
 "本地未下载" = "Not downloaded locally";
 "下载" = "Download";
-"切换后需重启app生效" = "Restart the app for changes to take effect";
 "（推荐）" = "(recommended)";
 "中文 ASR" = "Chinese ASR";
 "非中文 ASR" = "Non-Chinese ASR";
@@ -260,6 +273,7 @@
 "关闭" = "Close";
 
 /* ===== HUD: button .help() tooltips ===== */
+"字幕窗口背景透明度" = "Subtitle window background opacity";
 "复制全部字幕（译文 / 原文 / 全部）" = "Copy all subtitles (translation / source / all)";
 "缩小字幕" = "Decrease subtitle size";
 "放大字幕" = "Increase subtitle size";
