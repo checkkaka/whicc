@@ -227,6 +227,8 @@ jobs:
           name: ${{ github.ref_name }}
           generate_release_notes: true   # auto-generate from merged PRs
           body: |
+            ## 🌟 v0.2.0 — macOS 15 支持 + 性能与稳定性改进
+
             **大小**: ${{ steps.metadata.outputs.size }}
             **SHA256**: `${{ steps.metadata.outputs.sha }}`
 
@@ -234,8 +236,49 @@ jobs:
             `whicc.app` 拖到 `/Applications/`。首次启动：右键 → 打开
             （Gatekeeper 对 ad-hoc 签名应用的要求）。
 
+            ### 🎉 致谢
+
+            本次发布的全部代码改进来自 [@lyy0709](https://github.com/lyy0709)
+            贡献的 [PR #1](https://github.com/nbzz/whicc/pull/1) ——
+            12 个 commit，+1714 / -770 行。从 macOS 15 兼容到 ASR
+            模型切换的全链路打通，从下载进度的可视化到翻译服务节点
+            连接的稳定性 —— 没有这次贡献，whicc 还卡在 "UI 切模型
+            不生效"、"下载一直 0%"、以及 "macOS 15 上根本启动不了"
+            几个老大难问题上。
+
+            谢谢 [@lyy0709](https://github.com/lyy0709) 🫶
+
+            ### ✨ 主要改进
+
+            #### 🛡️ macOS 15 兼容（部署目标 26.0 → 15.0）
+            - `Info.plist` / `Package.swift` / `project.yml` 三处部署目标降到 15.0
+            - Liquid Glass（`GlassEffectContainer`）加
+              `if #available(macOS 26.0, *)` 兜底，macOS 15 上自动退化为
+              `ultraThinMaterial` 磨砂材质
+            - CI venv 改用 python-build-standalone，自包含解释器，
+              用户机无需装 Python
+            - 增加 build 后回归校验（mlx dylib minos、内嵌 python dyld 路径）
+
+            #### ⚡ 性能
+            - 音频采集去磁盘化（直读内存 queue，少 0.15-1.15s 摄取延迟）
+            - ASR 探针结果复用（每句字幕少一次完整推理）
+            - BackendLauncher 异步化，启动期间 UI 全程可响应
+            - 下载进度 "+1% 或 ≥3s" 双条件，慢速网络不再假死
+
+            #### 🐛 Bug 修复
+            - ASR 模型切换：UI 写槽位键、后端读旧字段，全链路接通 +
+              槽位不被覆盖
+            - 模型下载：取消真中断 + 断点续传 + 取消期间再点击的请求重放
+            - 翻译设置页：输入框防回流（"地址打一半被吃字"根治）+
+              `/v1` 兼容 + 5s 探活超时
+            - 后端进程监控：crash 自动重启 + 等配置/等模型友好提示
+            - 设置窗键盘焦点（`makeKeyAndOrderFront` 顺序修复）
+            - OpenAI Responses 端点 + API key 鉴权支持
+
             <details>
             <summary>English</summary>
+
+            ## 🌟 v0.2.0 — macOS 15 support + perf + stability
 
             **Size**: ${{ steps.metadata.outputs.size }}
             **SHA256**: `${{ steps.metadata.outputs.sha }}`
@@ -244,6 +287,53 @@ jobs:
             mount, drag `whicc.app` to `/Applications/`. First launch:
             right-click → Open (Gatekeeper requires this for ad-hoc
             signed builds).
+
+            ### 🎉 Credits
+
+            All code in this release was contributed by
+            [@lyy0709](https://github.com/lyy0709) in
+            [PR #1](https://github.com/nbzz/whicc/pull/1) — 12 commits,
+            +1714 / -770 lines. macOS 15 compat, end-to-end ASR model
+            switching, visible download progress, and stable
+            translation-service connection. Without this contribution,
+            whicc would still be stuck on "UI model switch has no effect",
+            "download progress frozen at 0%", and "doesn't even launch
+            on macOS 15".
+
+            Thank you [@lyy0709](https://github.com/lyy0709) 🫶
+
+            ### ✨ Highlights
+
+            #### 🛡️ macOS 15 compatibility (deployment target 26.0 → 15.0)
+            - `Info.plist` / `Package.swift` / `project.yml` deployment
+              targets lowered
+            - Liquid Glass (`GlassEffectContainer`) wrapped in
+              `if #available(macOS 26.0, *)`; macOS 15 falls back to
+              `ultraThinMaterial`
+            - CI venv switched to python-build-standalone (self-contained
+              interpreter, no Python install on user machine)
+            - Build-time regression guards (mlx dylib minos, embedded
+              python dyld)
+
+            #### ⚡ Performance
+            - Zero-disk audio pipeline (in-memory queue, 0.15-1.15s less
+              ingest latency)
+            - ASR probe result reuse (one fewer full inference per caption)
+            - Async BackendLauncher (UI responsive during boot)
+            - Download progress "+1% or ≥3s" dual threshold (no more
+              fake-stall)
+
+            #### 🐛 Bug fixes
+            - ASR model switching: slot key + backend read both wired
+              through
+            - Model download: real cancel + resume + replay queued
+              re-clicks
+            - Settings page: input rollback fix + `/v1` compat + 5s probe
+              timeout
+            - Backend process monitor: auto-restart on crash, friendly
+              notice for waiting-config / waiting-model exits
+            - Settings window keyboard focus (activation order fix)
+            - OpenAI Responses endpoint + API key auth
 
             </details>
           files: |
