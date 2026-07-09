@@ -144,9 +144,24 @@ final class BackendLauncher {
             ),
         ]
 
+        _monitorLock.lock()
+        _spawnContext = (python: python, src: src, logDir: logDir)
+        _monitored.removeAll()
+        _monitorLock.unlock()
         for backend in backends {
-            spawn(python: python, src: src, backend: backend, logDir: logDir)
+            if let proc = spawn(python: python, src: src, backend: backend,
+                                logDir: logDir) {
+                _monitorLock.lock()
+                _monitored.append(MonitoredProc(backend: backend,
+                                                process: proc, restarts: 0,
+                                                lastRestartAt: nil))
+                _monitorLock.unlock()
+            }
         }
+        // 存活监控:之前 spawn 完就不管了,whicc.py 崩掉后 UI 永远停在
+        // "正在聆听"(launcher 只扫日志关键词,不看进程死活 — SOP.md
+        // 记录过的盲点)。
+        startProcessMonitor()
 
         // ── 等待 ASR ready → 算总耗时 → 准备 banner ping 文案 ──
         // ASR 启动后 stdout 会打 "模型就绪。启动系统音频捕获..." (whicc.py:885),
@@ -339,7 +354,9 @@ final class BackendLauncher {
         try? handle.synchronize()
     }
 
-    private static func spawn(python: String, src: String, backend: BackendProc, logDir: String) {
+    @discardableResult
+    private static func spawn(python: String, src: String, backend: BackendProc,
+                              logDir: String, truncateLogs: Bool = true) -> Process? {
         fputs("[BackendLauncher] spawn \(backend.script) log=\(logDir)/\(backend.logName)\n", stderr)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
@@ -349,12 +366,16 @@ final class BackendLauncher {
         let stdoutPath = logDir + "/" + backend.logName
         let stderrPath = stdoutPath.replacingOccurrences(of: ".log", with: ".err.log")
         // truncate 模式 — 每次启动清空旧 log。
-        for path in [stdoutPath, stderrPath] {
-            do {
-                let empty = Data()
-                try empty.write(to: URL(fileURLWithPath: path))
-            } catch {
-                fputs("[BackendLauncher] WARN failed to create log \(path): \(error)\n", stderr)
+        // 崩溃后的自动重启传 truncateLogs=false:保留崩溃现场日志,
+        // 新输出 append 在后面。
+        if truncateLogs {
+            for path in [stdoutPath, stderrPath] {
+                do {
+                    let empty = Data()
+                    try empty.write(to: URL(fileURLWithPath: path))
+                } catch {
+                    fputs("[BackendLauncher] WARN failed to create log \(path): \(error)\n", stderr)
+                }
             }
         }
         // C6 修:stdout / stderr 用独立 FileHandle(独立 fd)。之前共用
@@ -369,8 +390,14 @@ final class BackendLauncher {
             // 退路:用 Pipe() 否则 Swift 端崩溃
             process.standardOutput = Pipe().fileHandleForWriting
             process.standardError = Pipe().fileHandleForWriting
-            try? process.run()
-            return
+            do { try process.run() } catch { return nil }
+            return process
+        }
+        if !truncateLogs {
+            // append 模式(崩溃重启):FileHandle 默认 offset=0 会覆盖
+            // 崩溃现场,seek 到尾部续写。
+            out.seekToEndOfFile()
+            err.seekToEndOfFile()
         }
         process.standardOutput = out
         process.standardError = err
@@ -382,7 +409,9 @@ final class BackendLauncher {
             fputs("[BackendLauncher] started \(backend.script) pid=\(process.processIdentifier)\n", stderr)
         } catch {
             fputs("[BackendLauncher] FAILED to start \(backend.script): \(error)\n", stderr)
+            return nil
         }
+        return process
     }
 
     /// 翻译节点总开关的默认值处理。
@@ -469,6 +498,12 @@ final class BackendLauncher {
     /// 丢到后台 Task 不阻塞主线程。
     static func terminateBackends() {
         guard AppPaths.isBundledApp else { return }
+        // 先停监控 — 不然它会把我们主动杀掉的进程又拉起来。
+        _monitorTimer?.cancel()
+        _monitorTimer = nil
+        _monitorLock.lock()
+        _monitored.removeAll()
+        _monitorLock.unlock()
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
         task.arguments = ["-9", "-f", "whicc-audio|glossary_refresher|translate_stream|whicc.py"]
@@ -477,5 +512,95 @@ final class BackendLauncher {
         try? task.run()
         // 不 waitUntilExit — applicationWillTerminate 在主线程,pkill 异步
         // 跑,SwiftUI 在 pkill 跑完前已经退到系统级清理流程。
+    }
+
+    // MARK: - 子进程存活监控
+
+    private struct MonitoredProc {
+        let backend: BackendProc
+        var process: Process
+        var restarts: Int
+        var lastRestartAt: Date?
+    }
+
+    private static var _monitored: [MonitoredProc] = []
+    private static let _monitorLock = NSLock()
+    private static var _monitorTimer: DispatchSourceTimer?
+    private static var _spawnContext: (python: String, src: String, logDir: String)?
+    /// 快速重启上限 — 连续崩这么多次后退避到慢速重试(模型未下载等
+    /// 持续性故障不值得每 5s 拉一次,但下载完成后慢速重试能自动恢复)。
+    private static let _fastRestarts = 3
+    private static let _slowRetryInterval: TimeInterval = 300
+
+    private static func startProcessMonitor() {
+        guard _monitorTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { checkProcesses() }
+        timer.resume()
+        _monitorTimer = timer
+        logAndStderr("[monitor] process liveness monitor started (5s interval)")
+    }
+
+    private static func checkProcesses() {
+        guard let ctx = _spawnContext else { return }
+        _monitorLock.lock()
+        defer { _monitorLock.unlock() }
+        let now = Date()
+        for i in _monitored.indices {
+            let m = _monitored[i]
+            guard !m.process.isRunning else { continue }
+            let code = m.process.terminationStatus
+            // 退避:快速重启次数耗尽后,每 _slowRetryInterval 才试一次
+            // (whicc.py 因模型未下载退出 → 用户下载完后自动恢复)。
+            if m.restarts >= _fastRestarts,
+               let last = m.lastRestartAt,
+               now.timeIntervalSince(last) < _slowRetryInterval {
+                continue
+            }
+            _monitored[i].restarts += 1
+            _monitored[i].lastRestartAt = now
+            let n = _monitored[i].restarts
+            logAndStderr("[monitor] \(m.backend.script) exited (code \(code)), "
+                         + "restart #\(n)\(n > _fastRestarts ? " (slow retry)" : "")")
+            appendBackendNotice(
+                zh: "⚠️ 后端 \(m.backend.script) 异常退出(code \(code)),自动重启中 #\(n)",
+                en: "⚠️ Backend \(m.backend.script) exited (code \(code)); auto-restarting #\(n)")
+            if let p = spawn(python: ctx.python, src: ctx.src,
+                             backend: m.backend, logDir: ctx.logDir,
+                             truncateLogs: false) {
+                _monitored[i].process = p
+            }
+        }
+    }
+
+    /// 往 translation_events.jsonl 追加一条通知(translation_final 事件),
+    /// 走 EventWatcher → OverlayState 的既有链路显示在字幕区 — 用户
+    /// 能直接看到"后端崩了/已重启",不用去翻日志。
+    private static func appendBackendNotice(zh: String, en: String) {
+        let transLogPath = AppPaths.runDir + "/translation_events.jsonl"
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        let entry: [String: Any] = [
+            "event_type": "translation_final",
+            "source_key": "monitor-\(ts)",
+            "source_update_mode": "reset_full",
+            "source_text": en,
+            "translated_full_text": zh,
+            "translate_ms": 0,
+            "shared_prefix_len": 0,
+            "glossary_hits": [],
+            "retried": false,
+            "fallback_reason": "",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: entry),
+              var line = String(data: data, encoding: .utf8),
+              let handle = FileHandle(forWritingAtPath: transLogPath) else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        line += "\n"
+        if let bytes = line.data(using: .utf8) {
+            handle.write(bytes)
+        }
     }
 }

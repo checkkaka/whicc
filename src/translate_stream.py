@@ -862,27 +862,43 @@ def main():
         endpoint = "auto"
     print(f"[translate] 翻译请求端点: {endpoint}", flush=True)
 
-    # __init__ 内部就做健康探活,失败抛异常 — 建一次直接用,失败就退出
-    # (比让进程空转报错更友好;早期版本先建一个丢弃的实例探活,再建正式的,
-    # 启动时白跑两次 GET /v1/models,已合并)。
-    try:
-        translator = HyMT2Translator(
-            model_id=model_id,
-            vllm_url=candidates,
-            model_map=model_map,
-            glossary_path=args.glossary,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            repetition_penalty=args.repetition_penalty,
-            max_new_tokens=args.max_new_tokens,
-            api_key_map=api_key_map,
-            endpoint=endpoint,
-        )
-        print(f"[translate] 已连接翻译服务,候选: {candidates}", flush=True)
-    except Exception as e:
-        print(f"[translate] 所有候选翻译节点都不可达: {e}", flush=True)
-        sys.exit(1)
+    # __init__ 内部就做健康探活,失败抛异常(早期版本先建一个丢弃的实例
+    # 探活再建正式的,启动时白跑两次 GET /v1/models,已合并)。
+    #
+    # 节点全不可达**不再退出** — 之前 sys.exit(1) 意味着用户后开
+    # LM Studio 也没用,必须手动"保存并重启"。改为等待模式:每 15s
+    # 重试,期间字幕照常显示原文(事件跳过不积压),连上自动恢复。
+    # --once(离线评估)保留立即退出:评估跑批不该空等。
+    def _try_build_translator():
+        try:
+            t = HyMT2Translator(
+                model_id=model_id,
+                vllm_url=candidates,
+                model_map=model_map,
+                glossary_path=args.glossary,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                repetition_penalty=args.repetition_penalty,
+                max_new_tokens=args.max_new_tokens,
+                api_key_map=api_key_map,
+                endpoint=endpoint,
+            )
+            print(f"[translate] 已连接翻译服务,候选: {candidates}", flush=True)
+            return t
+        except Exception as e:
+            print(f"[translate] 翻译节点暂不可达: {e}", flush=True)
+            return None
+
+    TRANSLATOR_RETRY_SEC = 15.0
+    translator = _try_build_translator()
+    last_translator_retry = time.monotonic()
+    if translator is None:
+        if args.once:
+            print("[translate] --once 模式且节点不可达,退出", flush=True)
+            sys.exit(1)
+        print(f"[translate] 进入等待模式:每 {TRANSLATOR_RETRY_SEC:.0f}s 重试,"
+              f"字幕先显示原文,翻译服务可达后自动恢复", flush=True)
 
     state = _load_state(state_path)
     byte_offset = state.get("byte_offset", 0)
@@ -915,13 +931,20 @@ def main():
     partial_cache: dict[str, tuple[str, str]] = {}
 
     worker = None
-    if is_partial_mode:
-        worker = TranslateWorker(
-            translator, trans_state, partial_cache,
-            f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode,
-        )
-        worker.start()
-        print("[translate] 同声传译模式（增量翻译 + 异步线程）", flush=True)
+
+    def _start_worker():
+        """partial 模式的异步翻译线程。translator 就绪时才建 —
+        等待模式下重连成功后由主循环补建。"""
+        nonlocal worker
+        if is_partial_mode and worker is None and translator is not None:
+            worker = TranslateWorker(
+                translator, trans_state, partial_cache,
+                f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode,
+            )
+            worker.start()
+            print("[translate] 同声传译模式（增量翻译 + 异步线程）", flush=True)
+
+    _start_worker()
 
     def _flush_state():
         # 注: 早期版本还持久化 processed_keys/failed_keys 两个集合,但去重
@@ -964,6 +987,8 @@ def main():
 
     def _try_reload_glossary():
         nonlocal _last_glossary_mtime, _glossary_check_counter
+        if translator is None:
+            return  # 等待模式:重连成功后 mtime 会被重置强制重灌
         _glossary_check_counter += 1
         if _glossary_check_counter % 200 != 0:  # 每 200 次循环检查一次
             return
@@ -996,7 +1021,9 @@ def main():
     _event_glossary_check_counter = 0
     _last_event_scene_mtime = 0.0
     _event_scene_check_counter = 0
-    _base_glossary = dict(translator.glossary)  # 保存永久词库快照
+    # 保存永久词库快照(等待模式下 translator 为 None,先空着 —
+    # 重连成功时主循环会重新初始化并强制重灌词库)
+    _base_glossary = dict(translator.glossary) if translator is not None else {}
     _event_active = False  # 当前是否有活跃事件
     _lang_check_counter = 0
 
@@ -1029,6 +1056,8 @@ def main():
     # ── 临时事件词库合并 ──
     def _merge_event_glossary():
         """将 event_glossary 合并到 _base_glossary 上，不修改 _base_glossary。"""
+        if translator is None:
+            return  # 等待模式:重连后强制重灌时再合并
         event_gloss = {}
         try:
             with open(event_glossary_path, "r", encoding="utf-8") as ef:
@@ -1053,6 +1082,8 @@ def main():
     # ── 临时事件词库热重载 ──
     def _try_reload_event_glossary():
         nonlocal _last_event_glossary_mtime, _event_glossary_check_counter
+        if translator is None:
+            return  # 等待模式:重连后 mtime 重置强制重灌
         _event_glossary_check_counter += 1
         if _event_glossary_check_counter % 200 != 0:
             return
@@ -1073,6 +1104,8 @@ def main():
     # ── 临时事件场景热重载 ──
     def _try_reload_event_scene():
         nonlocal _last_event_scene_mtime, _event_scene_check_counter, _event_active
+        if translator is None:
+            return  # 等待模式:重连后 mtime 重置强制重灌
         _event_scene_check_counter += 1
         if _event_scene_check_counter % 200 != 0:
             return
@@ -1121,6 +1154,18 @@ def main():
 
     try:
         while True:
+            # 等待模式:翻译服务不可达时限频重连,连上自动恢复(重灌
+            # 词库 + 补建 worker),用户不用"保存并重启"。
+            if translator is None and \
+                    time.monotonic() - last_translator_retry >= TRANSLATOR_RETRY_SEC:
+                last_translator_retry = time.monotonic()
+                translator = _try_build_translator()
+                if translator is not None:
+                    _base_glossary = dict(translator.glossary)
+                    _last_glossary_mtime = 0.0        # 强制重灌词库
+                    _last_event_glossary_mtime = 0.0  # 强制重灌事件词库
+                    _start_worker()
+
             _try_reload_glossary()
             _try_reload_lang()
             _try_reload_event_glossary()
@@ -1171,6 +1216,12 @@ def main():
                     continue
 
                 etype = event.get("event_type")
+
+                # 等待模式:服务不可达期间跳过事件(offset 照常推进,不
+                # 积压 — 实时字幕翻旧内容没有意义),字幕区继续显示
+                # ASR 原文 draft。
+                if translator is None:
+                    continue
 
                 # ── partial 事件（partial 模式，异步翻译 + 显示）──
                 if is_partial_mode and etype == "partial":
