@@ -55,7 +55,7 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 QWEN3_MODEL = "mlx-community/Qwen3-ASR-0.6B-4bit"  # 中文备用 ASR
 
 from model_state import (  # noqa: E402  (放在常量后避免循环 import)
-    read_model_state, write_model_state,
+    read_model_state,
     resolve_model_id, resolve_models_dir, resolve_chinese_model_id,
 )
 
@@ -72,6 +72,25 @@ def _detect_backend(model_path: str) -> str:
     if "nemotron" in name:
         return "nemotron"
     return "qwen3"
+
+def _is_model_complete(local_path: str) -> bool:
+    """本地模型目录是否完整可用。
+
+    残缺目录(下载中断留下的 config/tokenizer 但没有权重)用
+    os.path.isdir 判定会被当成有效模型 → load_model 抛
+    "No weight files found" → 整个 ASR 链路起不来。判定标准:
+    - model_downloader.py 下载成功后写的 <dir>.complete 标记;或
+    - 目录里有权重文件(safetensors/npz — 兼容用户手工拷贝的模型)。
+    """
+    if not os.path.isdir(local_path):
+        return False
+    if os.path.exists(local_path + ".complete"):
+        return True
+    try:
+        names = os.listdir(local_path)
+    except OSError:
+        return False
+    return any(n.endswith((".safetensors", ".npz")) for n in names)
 
 # 自适应 chunk (对齐 livecaption 策略,2026-06-28)
 #   min=2.0, soft_max=8.0, max=20.0 (兜底), punct=0.6s, silence=1.2s
@@ -742,15 +761,47 @@ def main():
         print(f"[model-state] 启动主模型={args.model} "
               f"(non_chinese_asr 槽位 > current_model > 默认)", flush=True)
     resolved_model = args.model
-    # 之前用老 MODEL_DIR（项目内 ../models/）拼路径，导致 --models-dir
-    # 形同虚设。修：用上一步算出的 models_dir（--models-dir > model_state > 兜底）。
-    local_model = os.path.join(models_dir, args.model.replace("/", "--"))
-    if os.path.isdir(local_model):
+
+    def _local_model_path(model_id: str) -> str:
+        # 之前用老 MODEL_DIR（项目内 ../models/）拼路径，导致 --models-dir
+        # 形同虚设。修：用上面算出的 models_dir（--models-dir > model_state > 兜底）。
+        return os.path.join(models_dir, model_id.replace("/", "--"))
+
+    # 启动候选链(打包模式):主槽 → 中文槽 → 内置默认。主槽模型残缺
+    # (下载中断,只有 config/tokenizer 没权重)时自动用下一个**完整**的
+    # 本地模型顶上 — 之前 os.path.isdir 就当"本地模型存在",加载必失败,
+    # 后端退出,用户已下载完好的另一个模型从没被试过,"说什么都没字幕"。
+    model_candidates = [args.model]
+    if state:
+        for cid in (resolve_chinese_model_id(state, QWEN3_MODEL), DEFAULT_MODEL):
+            if cid and cid not in model_candidates:
+                model_candidates.append(cid)
+
+    no_complete_local_model = False
+    local_model = _local_model_path(args.model)
+    if _is_model_complete(local_model):
         resolved_model = local_model
         print(f"使用本地模型: {resolved_model}", flush=True)
     elif os.path.isdir(args.model):
+        # CLI 直接传本地目录(离线评估场景),尊重用户,不做完整性把关
         resolved_model = args.model
         print(f"使用本地模型: {resolved_model}", flush=True)
+    elif state:
+        # 打包模式:主槽不可用 → 候选链找完整的顶上。不回退成 HF ID —
+        # 那会让 mlx 绕开 app 的下载管理直接联网拉 1GB+,启动卡死;
+        # 模型下载统一归 model_downloader 管。
+        if os.path.isdir(local_model):
+            print(f"[model-state] 主模型残缺(未下载完),跳过: {local_model}",
+                  flush=True)
+        fb_id = next((cid for cid in model_candidates[1:]
+                      if _is_model_complete(_local_model_path(cid))), None)
+        if fb_id is not None:
+            resolved_model = _local_model_path(fb_id)
+            print(f"[model-state] 降级到已下载完的模型: {fb_id}", flush=True)
+        else:
+            # 没有任何完整本地模型 — logger 建立后统一 exit 3(等模型),
+            # BackendLauncher 监控会弹"去设置页下载"指引。
+            no_complete_local_model = True
     else:
         print(f"使用 HF 模型: {resolved_model}", flush=True)
 
@@ -792,6 +843,18 @@ def main():
     logger = EventLogger(args.events_jsonl)
     logger.log_status("loading_model")
 
+    if no_complete_local_model:
+        # 主槽/中文槽/默认全都没下载完 — 音频采集还没 start,直接退。
+        # exit 3 = "等模型",BackendLauncher 按 code 弹下载指引,
+        # 检测到新 .complete 出现后自动重启(见 waitedResourceReady)。
+        print("[model-load] 本地无完整 ASR 模型(主槽/中文槽/默认均未下载完)",
+              file=sys.stderr, flush=True)
+        print("[model-load]   请在 macui 设置 → 模型 页下载", file=sys.stderr,
+              flush=True)
+        logger.log_status("model_load_failed")
+        logger.log_status("no complete local model")
+        sys.exit(3)
+
     # ── 启动加速: 音频采集先行 ──
     # 采集在模型加载/warmup(共 3-5s)期间并行进行,音频进 source.queue
     # 积累(容量 ~20s,远大于加载时长)。主循环开始时已有存量音频可
@@ -817,9 +880,10 @@ def main():
                 pass
         sys.exit(code)
 
-    #   whicc.py 不应该 crash 整个进程。fallback 路径:
-    #   qwen3 加载失败 → 切 nemotron 默认 (本地路径优先)
-    #   nemotron 加载失败 → 强制走本地路径,跳过 HF download
+    #   whicc.py 不应该 crash 整个进程。加载失败时沿候选链找下一个
+    #   路径不同且完整的本地模型 — 之前 fallback 固定指回 nemotron
+    #   默认路径,主模型本身就是 nemotron 时等于原地重试,必然二次
+    #   失败 → 后端退出,已下载完好的 Qwen3 从没被试过。
     fallback_used = False
     try:
         if resolved_backend == "qwen3":
@@ -828,24 +892,22 @@ def main():
         else:  # nemotron (默认)
             print("正在加载 Nemotron ASR 模型...", flush=True)
             _get_nemotron_model(resolved_model)
-    except Exception:
-        # 第一次加载失败。fallback: nemotron 本地路径 (不走 HF)
+    except Exception as e1:
         fallback_used = True
-        _model_load_failed = False  # 重置,允许 fallback 重试
-        local_nemotron = os.path.join(
-            models_dir, DEFAULT_MODEL.replace("/", "--")
-        )
-        if os.path.isdir(local_nemotron):
-            print(f"[fallback] 切到本地 nemotron: {local_nemotron}", flush=True)
+        fallback_path = next(
+            (p for p in (_local_model_path(cid) for cid in model_candidates)
+             if p != resolved_model and _is_model_complete(p)), None)
+        if fallback_path is not None:
+            fb_backend = _detect_backend(fallback_path)
+            print(f"[fallback] 主模型加载失败,切到本地 {fb_backend}: "
+                  f"{fallback_path}", flush=True)
             try:
-                _get_nemotron_model(local_nemotron)
-                resolved_model = local_nemotron
-                resolved_backend = "nemotron"
-                # 写 model_state.json 把 current_model 也修了,
-                # 下次启动不再踩这个坑。
-                write_model_state(
-                    args.model_state, models_dir, DEFAULT_MODEL
-                )
+                if fb_backend == "qwen3":
+                    _get_qwen3_model(fallback_path)
+                else:
+                    _get_nemotron_model(fallback_path)
+                resolved_model = fallback_path
+                resolved_backend = fb_backend
                 logger.log_status("model_fallback")
             except Exception as e2:
                 # 连 fallback 都失败 — 致命错误, 但仍然 log 给 macui,
@@ -865,13 +927,13 @@ def main():
                 # + 检测到模型下载完成后立即重启;其他 → 崩溃重启。
                 _exit_with_audio_cleanup(3)
         else:
-            # 本地也没下载 nemotron → 让用户去 macui 下载
-            print(f"[model-load] 本地 nemotron 不存在: {local_nemotron}",
+            # 没有其他完整本地模型可退 → 让用户去 macui 下载
+            print(f"[model-load] 主模型加载失败且无其他完整本地模型: {e1}",
                   file=sys.stderr, flush=True)
             print(f"[model-load]   请在 macui 设置里下载模型",
                   file=sys.stderr, flush=True)
             logger.log_status("model_load_failed")
-            logger.log_status(f"local nemotron not found at {local_nemotron}")
+            logger.log_status(str(e1))
             _exit_with_audio_cleanup(3)  # 3 = 等模型,见上方注释
 
     if fallback_used:
@@ -1298,15 +1360,22 @@ def main():
             # 只消费数据:live 模式读 source.queue,segdir 模式轮询段文件。
             # SIGINT/SIGTERM 时 audio_source.stop() 会优雅退出。
             #
-            # 保留 30s 长 stall 的总超时,防止 audio 源自己挂了重启又
-            # 不成功时,whicc.py 无限循环。
+            # 保留长 stall 总超时,防止 audio 源自己挂了重启又不成功时
+            # whicc.py 无限空转。12s = supervisor 5s stall 重启一次
+            # audiotee + 观察窗:救不回(macOS process tap 对 kill 后
+            # respawn 的 audiotee 常静默拒绝授权,只给零数据)就快速换
+            # 进程 — 新 whicc.py 进程 spawn 的 audiotee 能重新拿到授权
+            # (实测),比等 30s 少断流 18s。
             now = time.monotonic()
-            # 收到首段数据后才开始计 30s;启动期静音不退出。
-            if last_data_time is not None and now - last_data_time > 30.0:
-                print(f"\n[error] 音频源 30s 无数据,whicc.py 退出。"
-                      "检查 audio.py 错误日志或 audiotee 二进制。",
+            # 收到首段数据后才开始计时;启动期静音不退出。
+            if last_data_time is not None and now - last_data_time > 12.0:
+                print(f"\n[error] 音频源 12s 无数据(audiotee 重启也没救回),"
+                      "退出换新进程重新授权 process tap。",
                       file=sys.stderr, flush=True)
-                break
+                # exit 4 = 音频自愈重启(恢复性,不是故障)。BackendLauncher
+                # 按 code 给"正在自动恢复"文案而不是"异常退出"。
+                # SystemExit 会经 finally 完整清理(metrics/logger/audio)。
+                sys.exit(4)
 
             # 读取新音频:
             #  - live(system/mic): 阻塞至多 POLL_INTERVAL 等内存 queue 的
