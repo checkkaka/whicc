@@ -44,7 +44,7 @@ struct ModelPane: View {
                         (Text("\(asrCount)")
                          + Text(" 个语音识别 ASR 模型，共 ")
                          + Text(Self.formatBytes(totalSize))
-                         + Text("，卸载后自动释放磁盘空间"))
+                         + Text("，完全卸载需手动删除 ~/Library/Application Support/whicc/models"))
                             .font(.caption).foregroundColor(.secondary)
                         // 手动刷新按钮挪到这里：跟模型数量统计同框,
                         // 用户看 N 个模型时一眼能找到「刷新」入口。
