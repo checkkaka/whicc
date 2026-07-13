@@ -297,14 +297,15 @@ def _warmup_model(model_path: str, which: str) -> None:
 def do_transcribe(audio, language: str = "en",
                   model: str = DEFAULT_MODEL,
                   backend: str = "nemotron",
-                  nemotron_right_context: int = 13) -> dict:
+                  nemotron_right_context: int = 6) -> dict:
     """转录（非流式）。backend: 'nemotron' 或 'qwen3'。
 
     audio: WAV 路径(str) 或 float32 mono 16kHz 的 np.ndarray —
     两个后端的 generate 都原生支持数组输入(Nemotron 收 mx.array,
     Qwen3 直接收 ndarray),数组直传省掉"每次推理先写 WAV 再读回"
     的磁盘往返(探针每 0.6s 一次)。
-    nemotron_right_context: look-ahead 档位 3/6/13，对应 att_context_size。
+    nemotron_right_context: look-ahead 档位 3/6/13，对应 att_context_size；
+    默认 6（560ms），与 lang_config / UI 三档默认一致。
     """
     if backend == "qwen3":
         return _do_transcribe_qwen3(audio, language=language, model_path=model)
@@ -393,11 +394,12 @@ def _get_nemotron_model(model_path: str):
 
 def _do_transcribe_nemotron(audio, language: str = "en",
                             model_path: str = "",
-                            right_context: int = 13) -> dict:
+                            right_context: int = 6) -> dict:
     """Nemotron ASR 转录（非流式）。language='auto' 或空时自动检测。
     audio: WAV 路径或 float32 16kHz ndarray(generate 收 mx.array,
     ndarray 在这里转一层 — mx.array 包装零拷贝级开销)。
-    right_context: look-ahead 帧数，写入 att_context_size=[56, n]。
+    right_context: look-ahead 帧数，写入 att_context_size=[56, n]；
+    非法值回退 6（与 load_latency_config 一致）。
     """
     m = _get_nemotron_model(model_path)
     if isinstance(audio, np.ndarray):
@@ -405,7 +407,7 @@ def _do_transcribe_nemotron(audio, language: str = "en",
         audio = mx.array(audio)
     lang_param = None if language in ("auto", "") else language
     if right_context not in (3, 6, 13):
-        right_context = 13
+        right_context = 6
     # 批处理路径也按档位设置 look-ahead，与原生流式配置一致
     if hasattr(m, "default_att_context_size"):
         m.default_att_context_size = [56, right_context]
@@ -1157,8 +1159,13 @@ def main():
     print("模型预热中...", flush=True)
     _warmup_samples = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
     try:
+        # 业务目的：warmup 使用与运行一致的 look-ahead，避免默认 13 与配置 6 漂移
         do_transcribe(_warmup_samples, language="en",
-                      model=resolved_model, backend=resolved_backend)
+                      model=resolved_model, backend=resolved_backend,
+                      nemotron_right_context=(
+                          6 if resolved_backend != "nemotron"
+                          else args.nemotron_right_context
+                      ))
     except Exception:
         pass
 
@@ -1365,13 +1372,30 @@ def main():
         use_native_stream = False
 
     def reset_native_stream(reason: str = "") -> None:
-        """音频源切换/丢帧：重置流状态但不关闭开关。"""
+        """音频源切换/丢帧：重置流状态并清空本句缓冲，避免旧音源尾巴混入新源。"""
+        nonlocal collected, collected_count, sm_text, sm_segments, sm_result
+        nonlocal sm_audio, soft_max_remainder, has_speech, silence_streak
+        nonlocal speech_accumulated, speech_start_mono_ns, last_probe_text
         if nemotron_stream is not None:
             # 业务目的：切源后旧 encoder/RNNT 缓存失效，必须清空
             nemotron_stream.reset(language=args.language,
                                   right_context=args.nemotron_right_context)
             if reason:
                 print(f"[nemotron-stream] reset: {reason}", file=sys.stderr, flush=True)
+        # 业务目的：音源切换后丢弃未提交句缓冲与探针缓存，防止跨源拼接
+        collected = []
+        collected_count = 0
+        soft_max_remainder = np.array([], dtype=np.float32)
+        sm_text = None
+        sm_segments = None
+        sm_result = None
+        sm_audio = np.array([], dtype=np.float32)
+        has_speech = False
+        silence_streak = 0.0
+        speech_accumulated = 0.0
+        speech_start_mono_ns = 0
+        last_probe_text = ""
+        advance_source_revision()
 
     def emit_probe_partial(text: str, seg_start: int, seg_end: int) -> None:
         """探针/流式文本变化时写 is_probe partial。"""
@@ -1821,6 +1845,8 @@ def main():
                         if snap is None or not snap.changed or not snap.text:
                             continue
                         sm_text = snap.text.strip()
+                        # 业务目的：流式路径带回 segments，避免切点退化为字符比例
+                        sm_segments = list(snap.segments) if snap.segments else None
                         sm_audio = np.concatenate(collected) if collected else np.array([], dtype=np.float32)
                         sm_result = {
                             "text": sm_text,
@@ -1828,7 +1854,7 @@ def main():
                             "avg_logprob": -0.3,
                             "avg_compression": 0.0,
                             "no_speech_prob": 0.0,
-                            "segments": [],
+                            "segments": sm_segments or [],
                         }
                         # 从文本粗判语言，供分语言断句阈值使用
                         cjk_count = sum(1 for c in sm_text if "一" <= c <= "鿿")
@@ -1920,9 +1946,8 @@ def main():
                                  speech_sec=speech_accumulated,
                                  trailing_silence_sec=silence_streak,
                                  overlap_applied=False,
-                                 precomputed_result=sm_result if (
-                                     use_native_stream and sm_result is not None
-                                 ) else None)  # 不加 overlap: 已经精确切到标点位置
+                                 # 切半句不可复用整段流式文本，否则尾巴进 final
+                                 precomputed_result=None)
                     if use_native_stream and nemotron_stream is not None:
                         # 业务目的：断句后提交边界前文本，保留边界后流状态
                         nemotron_stream.commit_through(split_sec)
@@ -1978,12 +2003,22 @@ def main():
                                  speech_sec=speech_accumulated,
                                  trailing_silence_sec=silence_streak,
                                  overlap_applied=is_full and len(tail_overlap) > 0,
-                                 precomputed_result=sm_result if (
-                                     use_native_stream and sm_result is not None
-                                 ) else None)
+                                 # 切半句不可复用整段流式文本
+                                 precomputed_result=None)
                     if use_native_stream and nemotron_stream is not None:
-                        # 业务目的：软切后提交边界前文本，保留剩余流状态
-                        nemotron_stream.commit_through(split_sec)
+                        if is_full:
+                            # 整句提交后丢弃尾音缓冲，避免下一句混入上句残留
+                            try:
+                                nemotron_stream.finalize()
+                            except Exception:
+                                pass
+                            nemotron_stream.reset(
+                                language=args.language,
+                                right_context=args.nemotron_right_context,
+                            )
+                        else:
+                            # 业务目的：软切保留余量时 commit 边界后状态
+                            nemotron_stream.commit_through(split_sec)
                     soft_max_remainder = remainder_audio if not is_full else np.array([], dtype=np.float32)
                     collected = []
                     collected_count = 0

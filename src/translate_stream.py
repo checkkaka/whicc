@@ -684,6 +684,7 @@ class TranslateWorker:
                 cancel_check=cancel_ev.is_set,
             )
         except TranslationCancelled:
+            self.partial_cache.pop(key, None)
             self._save_partial_snapshot(
                 key, source_text=source_text, translated_text="",
                 completed=False, output_valid=False,
@@ -692,6 +693,7 @@ class TranslateWorker:
             return
         except Exception as exc:
             print(f"\n[partial] 全量翻译失败: {exc}", flush=True)
+            self.partial_cache.pop(key, None)
             self._write_failed_partial(key, source_text)
             self._save_partial_snapshot(
                 key, source_text=source_text, translated_text="",
@@ -705,7 +707,9 @@ class TranslateWorker:
         completed_ns = time.monotonic_ns()
         cleaned_zh, leak_hit = _strip_prompt_leak(full_zh)
         bad = _is_explanation(cleaned_zh) or leak_hit or not cleaned_zh.strip()
-        output_valid = not bad
+        # length/incomplete 截断视为无效，禁止 final 复用半截译文
+        fr = getattr(self.translator, "last_finish_reason", None) or "stop"
+        output_valid = (not bad) and fr not in ("length", "incomplete", "max_tokens")
         self._save_partial_snapshot(
             key,
             source_text=source_text,
@@ -714,9 +718,9 @@ class TranslateWorker:
             output_valid=output_valid,
             request_signature=sig,
             translate_ms=float(ms),
-            finish_reason=getattr(self.translator, "last_finish_reason", None),
+            finish_reason=fr,
         )
-        if bad:
+        if bad or not output_valid:
             return
 
         # 补一条带完成时间戳的 partial（不 commit）
@@ -759,6 +763,10 @@ class TranslateWorker:
         except Exception:
             return None
         if snap.get("request_signature") != cur_sig:
+            return None
+        # length/incomplete 截断译文禁止复用，避免半截进 final
+        fr = snap.get("finish_reason") or "stop"
+        if fr in ("length", "incomplete", "max_tokens"):
             return None
         return {**snap, "translated_text": cleaned}
 

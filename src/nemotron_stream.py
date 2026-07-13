@@ -31,14 +31,37 @@ class StreamSnapshot:
     audio_sec: float
     tokens: list[Any] = field(default_factory=list)
     changed: bool = False
+    # 切点用时间戳；空列表时主循环退化为字符比例切点
+    segments: list[dict] = field(default_factory=list)
+
+
+def _sentences_to_segments(sentences) -> list[dict]:
+    """把 Nemotron sentences 规范为 {text,start,end}（避免依赖 whicc 循环导入）。"""
+    out: list[dict] = []
+    for sent in sentences or []:
+        text = getattr(sent, "text", None)
+        if text is None and isinstance(sent, dict):
+            text = sent.get("text", "")
+        start = getattr(sent, "start", None)
+        if start is None and isinstance(sent, dict):
+            start = sent.get("start", 0.0)
+        end = getattr(sent, "end", None)
+        if end is None and isinstance(sent, dict):
+            end = sent.get("end", 0.0)
+        out.append({
+            "text": text or "",
+            "start": float(start or 0.0),
+            "end": float(end or 0.0),
+        })
+    return out
 
 
 class NemotronStream:
     """跨实时 PCM 输入持久保存 encoder/RNNT 状态的流式包装。
 
-    当前实现：在无法接入 mlx stream_encode 时，用增量缓冲 + 整段
-    generate 回退（仍按原生 chunk 边界触发），保证接口可用；Apple
-    Silicon 上可替换为真正的 cache-aware 路径。
+    重要：当前默认路径不是真 cache-aware 流式。无 mlx stream_encode
+    时用增量缓冲 + 整段 generate 回退（仍按原生 chunk 边界触发）。
+    真机启用前须用 tools/nemotron_replay.py 过门禁；开关默认保持 false。
     """
 
     def __init__(self, model: Any = None, *, language: str = "auto",
@@ -127,11 +150,25 @@ class NemotronStream:
             if len(all_pcm) < need:
                 return None
         text = self._text
+        segments: list[dict] = []
         if self._generate_fn is not None:
-            # 调用注入的 generate：便于单测与无 MLX 环境回退
-            result = self._generate_fn(all_pcm, language=self.language,
-                                       right_context=self.right_context)
-            text = (result.get("text") if isinstance(result, dict) else str(result)).strip()
+            try:
+                # 调用注入的 generate：便于单测与无 MLX 环境回退
+                result = self._generate_fn(all_pcm, language=self.language,
+                                           right_context=self.right_context)
+                if isinstance(result, dict):
+                    text = (result.get("text") or "").strip()
+                    # 优先用现成 segments；否则从 sentences 转换，供精确切点
+                    segs = result.get("segments")
+                    if segs:
+                        segments = list(segs)
+                    else:
+                        segments = _sentences_to_segments(result.get("sentences"))
+                else:
+                    text = str(result).strip()
+            except Exception as e:
+                # 上抛让主循环 disable_native_stream，避免静默卡在空结果
+                raise RuntimeError(f"NemotronStream generate failed: {e}") from e
         elif self.model is not None and hasattr(self.model, "generate"):
             try:
                 import mlx.core as mx
@@ -142,8 +179,11 @@ class NemotronStream:
                     att_context_size=[56, self.right_context],
                 )
                 text = (r.text or "").strip()
-            except Exception:
-                return None
+                sentences = r.sentences if hasattr(r, "sentences") else []
+                segments = _sentences_to_segments(sentences)
+            except Exception as e:
+                # 上抛让主循环 disable_native_stream，避免静默卡在空结果
+                raise RuntimeError(f"NemotronStream generate failed: {e}") from e
         changed = text != self._last_emitted
         self._text = text
         self._last_emitted = text
@@ -153,4 +193,5 @@ class NemotronStream:
             text=text,
             audio_sec=len(all_pcm) / self._sample_rate,
             changed=changed,
+            segments=segments,
         )

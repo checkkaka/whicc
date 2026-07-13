@@ -349,6 +349,63 @@ def test_final_reuses_matching_partial():
     assert translator.translate_calls == []  # 未全量重译
 
 
+def test_length_finish_reason_not_reused():
+    """finish_reason=length 的截断 partial 禁止复用。"""
+    worker, translator, f_trans = _make_worker()
+    # 直接写入截断快照，绕过流式桩
+    sig = translator.build_request_signature("hello")
+    worker._partial_snapshots["k-len"] = {
+        "source_text": "hello",
+        "translated_text": "半截译",
+        "completed": True,
+        "output_valid": True,
+        "request_signature": sig,
+        "translate_ms": 10.0,
+        "finish_reason": "length",
+    }
+    worker.partial_cache["k-len"] = ("hello", "半截译")
+    assert worker._can_reuse_partial("k-len", "hello", "Simplified Chinese") is None
+
+    worker.start()
+    worker.dispatch_final(
+        {"seg_start": 0, "seg_end": 1, "audio_end_sec": 1,
+         "audio_start_sec": 0, "text": "hello", "accepted": True},
+        "hello", "k-len",
+    )
+    deadline = time.time() + 3
+    while not translator.translate_calls and time.time() < deadline:
+        time.sleep(0.02)
+    worker.stop()
+    assert translator.translate_calls == ["hello"]
+    lines = [json.loads(x) for x in f_trans.getvalue().splitlines() if x.strip()]
+    finals = [x for x in lines if x.get("event_type") == "translation_final"]
+    assert finals and finals[-1].get("final_reused_partial") is not True
+
+
+def test_cancelled_partial_clears_partial_cache():
+    """取消后 partial_cache 条目被清除，避免脏缓存。"""
+    worker, translator, f_trans = _make_worker()
+    translator._block_until = threading.Event()
+    worker.start()
+    worker.dispatch_partial(
+        {"seg_start": 0, "seg_end": 1, "revision": 1, "audio_end_sec": 1,
+         "audio_start_sec": 0, "text": "hello"},
+        "hello", "k-cache-clear",
+    )
+    assert translator._started.wait(2)
+    worker.dispatch_final(
+        {"seg_start": 0, "seg_end": 1, "audio_end_sec": 1,
+         "audio_start_sec": 0, "text": "hello", "accepted": True},
+        "hello", "k-cache-clear",
+    )
+    translator._block_until.set()
+    deadline = time.time() + 3
+    while not translator.translate_calls and time.time() < deadline:
+        time.sleep(0.02)
+    worker.stop()
+    assert "k-cache-clear" not in worker.partial_cache
+
+
 def test_signature_mismatch_forces_full_retranslate():
     worker, translator, f_trans = _make_worker()
     worker.start()
