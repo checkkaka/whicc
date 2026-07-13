@@ -36,6 +36,7 @@ struct HUDView: View {
     /// 指示), 等 whicc.py 写回 status 状态或下一次 ASR partial
     /// 到达时橙色自然消失。
     private func cycleAudioSource() {
+        // HUD chip 只在 system ↔ mic 之间循环；指定应用模式点一下回到系统音频。
         let next: AudioSource = (state.audioSource == .system) ? .mic : .system
         state.audioSource = next
         langConfig.setAudioSource(next.rawValue)

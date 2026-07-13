@@ -40,10 +40,10 @@ struct SettingsSectionHeader<Trailing: View>: View {
     let icon: String
     let title: LocalizedStringKey
     let tint: Color
-    let trailing: Trailing?
+    let trailing: Trailing
 
     init(icon: String, title: LocalizedStringKey, tint: Color = .accentColor,
-         @ViewBuilder trailing: () -> Trailing? = { nil }) {
+         @ViewBuilder trailing: () -> Trailing) {
         self.icon = icon
         self.title = title
         self.tint = tint
@@ -58,10 +58,15 @@ struct SettingsSectionHeader<Trailing: View>: View {
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
             Spacer(minLength: 0)
-            if let trailing {
-                trailing
-            }
+            trailing
         }
+    }
+}
+
+extension SettingsSectionHeader where Trailing == EmptyView {
+    /// 无 trailing 时的便利初始化，避免调用方漏写 EmptyView 导致泛型无法推断。
+    init(icon: String, title: LocalizedStringKey, tint: Color = .accentColor) {
+        self.init(icon: icon, title: title, tint: tint, trailing: { EmptyView() })
     }
 }
 
