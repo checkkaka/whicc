@@ -191,3 +191,48 @@ def test_nemotron_stream_same_audio_different_block_sizes():
         i += block
     t_rand = s.finalize().text
     assert t100 == t128 == t_rand
+
+
+def test_nemotron_stream_propagates_generate_errors():
+    from nemotron_stream import NemotronStream
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("mlx boom")
+
+    s = NemotronStream(generate_fn=boom, right_context=6)
+    with pytest.raises(RuntimeError, match="NemotronStream generate failed"):
+        s.feed(np.zeros(10000, dtype=np.float32))
+
+
+def test_nemotron_stream_carries_segments_for_split():
+    """流式快照带回 segments，切点可用时间戳而非字符比例。"""
+    import whicc
+    from nemotron_stream import NemotronStream
+
+    def fake_generate(audio, language="auto", right_context=6):
+        return {
+            "text": "Hello world. More",
+            "segments": [
+                {"text": "Hello world.", "start": 0.0, "end": 1.1},
+                {"text": " More", "start": 1.1, "end": 1.8},
+            ],
+        }
+
+    s = NemotronStream(generate_fn=fake_generate, right_context=6)
+    snap = s.feed(np.zeros(10000, dtype=np.float32))
+    assert snap is not None
+    assert snap.segments
+    split_sec, method = whicc.find_audio_split_sec(
+        snap.text, snap.audio_sec, snap.segments)
+    assert method == "segments"
+    assert split_sec == pytest.approx(1.1)
+
+
+def test_do_transcribe_default_right_context_is_six():
+    import inspect
+    import whicc
+
+    sig = inspect.signature(whicc.do_transcribe)
+    assert sig.parameters["nemotron_right_context"].default == 6
+    sig2 = inspect.signature(whicc._do_transcribe_nemotron)
+    assert sig2.parameters["right_context"].default == 6
