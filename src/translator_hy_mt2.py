@@ -10,11 +10,17 @@
   HyMT2Translator.translate_delta(delta_text, ...) → (zh, ms, meta)
 """
 
+import hashlib
 import json
 import os
 import re
 import time
 from typing import Callable
+
+
+class TranslationCancelled(Exception):
+    """流式翻译被更高优先级任务（final / 更新 revision）取消。"""
+    pass
 
 # ── 术语表 ──────────────────────────────────────────────────────────────────────
 
@@ -957,7 +963,8 @@ class VLLMBackend:
                            temperature: float = 0.7,
                            top_p: float = 0.6, top_k: int = 20,
                            repetition_penalty: float = 1.05,
-                           max_new_tokens: int = 80) -> str:
+                           max_new_tokens: int = 80,
+                           cancel_check: Callable[[], bool] | None = None) -> str:
         """Generate with SSE streaming from vLLM.
 
         on_token receives (piece, full_so_far) per token. The first
@@ -965,11 +972,16 @@ class VLLMBackend:
         second is the cumulative text including this piece. Callers
         that only want the running total can ignore the first
         argument with `lambda piece, full: handler(full)`.
+
+        cancel_check: 每读一条 SSE 前检查；为 True 时关闭响应并抛
+        TranslationCancelled，供 final / 更新 revision 抢占带宽。
         """
         # auto 端点模式: 404/405 时切另一个端点重试一次。
         # httpx.stream 复用 _http_client 的 keep-alive 连接 — SSE 首 token
         # 延迟里省掉整段代理 CONNECT + TLS 握手。
         for attempt in range(2):
+            if cancel_check and cancel_check():
+                raise TranslationCancelled("cancelled before request")
             path, body = self._build_request(
                 messages, temperature, top_p, top_k,
                 repetition_penalty, max_new_tokens, stream=True)
@@ -984,14 +996,22 @@ class VLLMBackend:
                         continue
                     raise RuntimeError(
                         f"generate_streaming: HTTP {resp.status_code}")
-                return self._consume_sse(resp, on_token)
+                return self._consume_sse(resp, on_token, cancel_check=cancel_check)
         raise RuntimeError("generate_streaming: 无可用端点")  # 防御
 
-    def _consume_sse(self, resp, on_token) -> str:
+    def _consume_sse(self, resp, on_token,
+                     cancel_check: Callable[[], bool] | None = None) -> str:
         """消费 SSE 流,逐 token 回调。chat 与 responses 两种事件格式。"""
         full = ""
         is_responses = self._active_endpoint == "responses"
         for raw_line in resp.iter_lines():
+            # 业务目的：final 入队后立刻停掉同 key 的 partial SSE，释放带宽
+            if cancel_check and cancel_check():
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                raise TranslationCancelled("sse cancelled")
             line = raw_line.strip()
             if not line or not line.startswith("data: "):
                 continue  # 跳过空行和 `event:` 行(Responses SSE 会发)
@@ -1078,7 +1098,8 @@ class HyMT2Translator:
         return raw, elapsed_ms
 
     def _generate_streaming(self, messages: list[dict],
-                            on_token: Callable[[str, str], None]) -> tuple[str, float]:
+                            on_token: Callable[[str, str], None],
+                            cancel_check: Callable[[], bool] | None = None) -> tuple[str, float]:
         """流式推理，on_token(piece, full_so_far) 随每个 token 触发。
 
         第一参数是 SSE / TextStreamer 给的 token piece，第二参数
@@ -1095,10 +1116,45 @@ class HyMT2Translator:
             top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
             max_new_tokens=self.max_new_tokens,
+            cancel_check=cancel_check,
         )
         elapsed_ms = (time.monotonic() - t0) * 1000
         raw, _ = _strip_context_echo(raw.strip())
         return raw, elapsed_ms
+
+    def build_request_signature(self, source_text: str,
+                                target_lang: str = "Simplified Chinese",
+                                context: list[dict] | list[str] | None = None) -> str:
+        """生成翻译请求签名，供 final 判断能否安全复用 partial 译文。
+
+        覆盖 messages/prompt、上下文、场景、术语表、目标语言、模型、
+        服务地址、temperature/top_p/top_k/repetition_penalty/max tokens；
+        故意忽略 stream 字段（流式与非流式语义等价）。
+        """
+        hits = detect_glossary_hits(source_text, self.glossary, target_lang)
+        effective_ctx = context if should_use_context(source_text) else None
+        messages = build_messages(
+            source_text, glossary_hits=hits, context=effective_ctx,
+            target_lang=target_lang,
+        )
+        backend = self._backend
+        model_id = getattr(backend, "_active_model_id", None) or getattr(backend, "model_id", "")
+        payload = {
+            "messages": messages,
+            "context": effective_ctx,
+            "scene": get_scene_context(),
+            "glossary_hits": hits,
+            "target_lang": target_lang,
+            "model": model_id,
+            "base_url": getattr(backend, "base_url", "") or "",
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repetition_penalty": self.repetition_penalty,
+            "max_new_tokens": self.max_new_tokens,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _retry_if_bad(self, raw: str, source_text: str,
                       glossary_hits: dict, elapsed_ms: float,
@@ -1180,19 +1236,21 @@ class HyMT2Translator:
     def translate_streaming(self, source_text: str,
                             on_token: Callable[[str, str], None],
                             context: list[dict] | list[str] | None = None,
-                            target_lang: str = "Simplified Chinese") -> tuple[str, float]:
+                            target_lang: str = "Simplified Chinese",
+                            cancel_check: Callable[[], bool] | None = None) -> tuple[str, float]:
         """流式全量翻译。
 
         on_token 接收 (piece, full_so_far)：
         - piece: 新增的 token 片段（delta.content / TextStreamer yield）
         - full_so_far: 累计全文（包含本 piece）
         调用方如只需累计全文可写 lambda piece, full: handler(full)。
+        cancel_check: 透传到 SSE 循环，被抢占时抛 TranslationCancelled。
         """
         global _last_translation
         hits = detect_glossary_hits(source_text, self.glossary, target_lang)
         effective_ctx = context if should_use_context(source_text) else None
         messages = build_messages(source_text, glossary_hits=hits, context=effective_ctx, target_lang=target_lang)
-        raw, elapsed_ms = self._generate_streaming(messages, on_token)
+        raw, elapsed_ms = self._generate_streaming(messages, on_token, cancel_check=cancel_check)
         initial_bad = _is_bad_output(raw, target_lang)
         raw, elapsed_ms, retried = self._retry_if_bad(raw, source_text, hits, elapsed_ms, target_lang=target_lang)
         if retried:
@@ -1204,7 +1262,8 @@ class HyMT2Translator:
         result, post_meta = postprocess_translation(raw.strip())
         if effective_ctx and _looks_like_context_echo(result, _last_translation):
             messages_nc = build_messages(source_text, glossary_hits=hits, context=None, target_lang=target_lang)
-            raw2, elapsed2 = self._generate_streaming(messages_nc, on_token)
+            raw2, elapsed2 = self._generate_streaming(
+                messages_nc, on_token, cancel_check=cancel_check)
             raw2, elapsed2, retried2 = self._retry_if_bad(raw2, source_text, hits, elapsed2, target_lang=target_lang)
             if retried2:
                 # 同上:双参回调,单参调用是必崩 bug

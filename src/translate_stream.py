@@ -18,17 +18,19 @@
 """
 
 import argparse
+import itertools
 import json
 import os
 import sys
 import threading
 import time
 import datetime
-from queue import Queue, Empty
+from queue import Queue, PriorityQueue, Empty
 
 from translator_hy_mt2 import (
     HyMT2Translator, classify_update, detect_language, detect_glossary_hits,
     set_scene_context, get_scene_context, _strip_prompt_leak,
+    TranslationCancelled,
 )
 from languages import normalize_target_language, TargetLanguage
 
@@ -120,6 +122,10 @@ def _bilingual_line(event: dict, zh_text: str) -> str:
 
 
 def _source_key(event: dict) -> str:
+    """优先用事件自带的稳定 source_key；否则回退 seg 拼接键。"""
+    existing = event.get("source_key")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
     return f"{event['seg_start']}-{event['seg_end']}-{event.get('audio_end_sec', 0)}"
 
 
@@ -377,10 +383,21 @@ class TranslationState:
 # ── 异步翻译工作线程 ──────────────────────────────────────────────────────────
 
 class TranslateWorker:
-    """后台翻译线程：partial 模式下异步处理翻译任务。"""
+    """后台翻译线程：partial 模式下异步处理翻译任务。
+
+    优先级队列（translation_priority_enabled=True）：
+      - final 优先级 0，全部保留按到达顺序
+      - partial 优先级 1，同 source_key 只保留最新 revision（无 revision 则 0）
+      - final 入队时立即取消同 key 进行中的 partial SSE
+    关闭开关时回退到旧的 batch drain 丢弃逻辑。
+    """
+
+    _PRI_FINAL = 0
+    _PRI_PARTIAL = 1
 
     def __init__(self, translator, trans_state, partial_cache,
-                 f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode):
+                 f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode,
+                 priority_enabled: bool = True):
         self.translator = translator
         self.trans_state = trans_state
         self.partial_cache = partial_cache
@@ -390,34 +407,164 @@ class TranslateWorker:
         self.out_lock = out_lock
         self.counts = counts
         self.is_partial_mode = is_partial_mode
-        self._queue: Queue = Queue()
+        self.priority_enabled = bool(priority_enabled)
+        self._seq = itertools.count()
+        self._queue = PriorityQueue() if self.priority_enabled else Queue()
         self._auto_promote_timer: threading.Timer | None = None
         self._last_partial_key: str | None = None
         self._last_partial_zh: str | None = None
         self._last_partial_src: str | None = None
         self._last_partial_event: dict | None = None
-        # 增量翻译状态：每个 key 追踪上一次的源文本和翻译
-        self._partial_state: dict[str, tuple[str, str]] = {}  # key → (last_src, last_zh)
+        # partial 完成后的可复用快照（替代旧 _partial_state 增量拼接）
+        self._partial_snapshots: dict[str, dict] = {}
+        # 同 key 世代号：更新 revision / final 入队时递增，出队时比对丢弃过期项
+        self._partial_generation: dict[str, int] = {}
+        self._latest_partial_revision: dict[str, int] = {}
+        self._inflight_cancel: dict[str, threading.Event] = {}
+        self._cancel_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self._thread.start()
 
     def stop(self):
-        self._queue.put(None)
+        if self.priority_enabled:
+            # PriorityQueue 哨兵：优先级最高，尽快唤醒
+            self._queue.put((-1, next(self._seq), None))
+        else:
+            self._queue.put(None)
         self._thread.join(timeout=120)
         if self._thread.is_alive():
             print("[warn] worker thread did not exit within 120s, closing files anyway", flush=True)
 
+    def _bump_generation(self, key: str) -> int:
+        """递增同 key 世代，使队列中更早的 partial 在出队时失效。"""
+        gen = self._partial_generation.get(key, 0) + 1
+        self._partial_generation[key] = gen
+        return gen
+
+    def _request_cancel(self, key: str) -> None:
+        """业务目的：final / 更新 revision 立刻打断同 key 进行中的 partial SSE。"""
+        with self._cancel_lock:
+            ev = self._inflight_cancel.get(key)
+            if ev is not None:
+                ev.set()
+
+    def _bind_cancel(self, key: str) -> threading.Event:
+        """为即将开始的翻译绑定取消事件。"""
+        ev = threading.Event()
+        with self._cancel_lock:
+            old = self._inflight_cancel.get(key)
+            if old is not None:
+                old.set()
+            self._inflight_cancel[key] = ev
+        return ev
+
+    def _unbind_cancel(self, key: str, ev: threading.Event) -> None:
+        with self._cancel_lock:
+            if self._inflight_cancel.get(key) is ev:
+                del self._inflight_cancel[key]
+
     def dispatch_partial(self, event, source_text, key):
         """异步处理 partial 事件（仅翻译 + 显示，不写文件）。"""
-        self._queue.put(("partial", event, source_text, key))
+        try:
+            revision = int(event.get("revision") or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        enqueued_ns = time.monotonic_ns()
+        if self.priority_enabled:
+            latest = self._latest_partial_revision.get(key, -1)
+            if revision < latest:
+                # 旧 revision 直接丢，避免占队列
+                print(f"[translate] 丢弃过期 partial revision "
+                      f"(key={key} rev={revision} < {latest})", flush=True)
+                return
+            self._latest_partial_revision[key] = revision
+            gen = self._bump_generation(key)
+            # 新 revision 抢占：取消同 key 进行中的流
+            self._request_cancel(key)
+            item = {
+                "mode": "partial",
+                "event": event,
+                "source_text": source_text,
+                "key": key,
+                "revision": revision,
+                "generation": gen,
+                "translation_enqueued_mono_ns": enqueued_ns,
+            }
+            self._queue.put((self._PRI_PARTIAL, next(self._seq), item))
+        else:
+            self._queue.put(("partial", event, source_text, key, enqueued_ns))
 
     def dispatch_final(self, event, source_text, key):
         """异步处理 final 事件（翻译 + 显示 + 写文件）。"""
-        self._queue.put(("final", event, source_text, key))
+        enqueued_ns = time.monotonic_ns()
+        if self.priority_enabled:
+            # final 入队瞬间取消同 key partial，并作废排队中的 partial
+            self._bump_generation(key)
+            self._request_cancel(key)
+            item = {
+                "mode": "final",
+                "event": event,
+                "source_text": source_text,
+                "key": key,
+                "revision": int(event.get("revision") or 0) if event.get("revision") is not None else 0,
+                "generation": self._partial_generation.get(key, 0),
+                "translation_enqueued_mono_ns": enqueued_ns,
+            }
+            self._queue.put((self._PRI_FINAL, next(self._seq), item))
+        else:
+            self._queue.put(("final", event, source_text, key, enqueued_ns))
 
     def _run(self):
+        if self.priority_enabled:
+            self._run_priority()
+        else:
+            self._run_legacy()
+
+    def _run_priority(self):
+        """单优先级队列：用世代/版本比较替代 batch drain 丢弃。"""
+        processed = 0
+        dropped = 0
+        while True:
+            try:
+                priority, _seq, item = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if item is None:
+                break
+            mode = item["mode"]
+            key = item["key"]
+            if mode == "partial":
+                # 版本比较：只处理当前世代的最新 partial
+                if item.get("generation") != self._partial_generation.get(key):
+                    dropped += 1
+                    continue
+            try:
+                if mode == "partial":
+                    self._do_partial(
+                        item["event"], item["source_text"], key,
+                        enqueued_ns=item.get("translation_enqueued_mono_ns"),
+                        generation=item.get("generation"),
+                    )
+                else:
+                    out_event = self._do_final(
+                        item["event"], item["source_text"], key,
+                        enqueued_ns=item.get("translation_enqueued_mono_ns"),
+                    )
+                    self._write_final_output(out_event, item["event"])
+                processed += 1
+            except Exception as exc:
+                print(f"\n[warn] worker error ({processed} done): {exc}",
+                      flush=True)
+                import traceback; traceback.print_exc()
+        if dropped > 0:
+            print(f"[translate] 队列积压,丢弃 {dropped} 条过期 partial",
+                  flush=True)
+        print(f"[translate] worker exiting after {processed} items", flush=True)
+
+    def _run_legacy(self):
+        """关闭优先级开关时：接近旧逻辑的 batch drain 丢弃。"""
         processed = 0
         stopping = False
         while not stopping:
@@ -427,13 +574,6 @@ class TranslateWorker:
                 continue
             if item is None:
                 break
-            # ── 积压合并:把队列里已到的任务一次性取出,过期 partial 丢弃 ──
-            # 单线程 worker + 每个请求秒级网络延迟,ASR partial(~0.6s 一个)
-            # 必然产出快于消费 — 不丢弃的话队列越积越深,用户看到的字幕
-            # 是几十秒前的内容("翻译非常卡顿"的直接原因)。规则:
-            #  - final 全保留(要写文件/进字幕历史),按到达顺序处理;
-            #  - partial 是 draft,同 key 只有最新一条有意义;该 key 已有
-            #    final 在队里的,partial 直接丢(final 马上覆盖它)。
             batch = [item]
             while True:
                 try:
@@ -441,7 +581,7 @@ class TranslateWorker:
                 except Empty:
                     break
                 if nxt is None:
-                    stopping = True  # 处理完本批再退,final 不丢
+                    stopping = True
                     break
                 batch.append(nxt)
             finals = [it for it in batch if it[0] == "final"]
@@ -449,18 +589,21 @@ class TranslateWorker:
             latest_partial: dict[str, tuple] = {}
             for it in batch:
                 if it[0] == "partial" and it[3] not in final_keys:
-                    latest_partial[it[3]] = it  # 后到覆盖先到 → 只留最新
+                    latest_partial[it[3]] = it
             dropped = len(batch) - len(finals) - len(latest_partial)
             if dropped > 0:
                 print(f"[translate] 队列积压,丢弃 {dropped} 条过期 partial",
                       flush=True)
-            for mode, event, source_text, key in \
-                    finals + list(latest_partial.values()):
+            for entry in finals + list(latest_partial.values()):
+                mode, event, source_text, key = entry[0], entry[1], entry[2], entry[3]
+                enqueued_ns = entry[4] if len(entry) > 4 else None
                 try:
                     if mode == "partial":
-                        self._do_partial(event, source_text, key)
+                        self._do_partial(event, source_text, key,
+                                         enqueued_ns=enqueued_ns)
                     else:
-                        out_event = self._do_final(event, source_text, key)
+                        out_event = self._do_final(event, source_text, key,
+                                                   enqueued_ns=enqueued_ns)
                         self._write_final_output(out_event, event)
                     processed += 1
                 except Exception as exc:
@@ -469,146 +612,211 @@ class TranslateWorker:
                     import traceback; traceback.print_exc()
         print(f"[translate] worker exiting after {processed} items", flush=True)
 
-    def _do_partial(self, event, source_text, key):
-        """Partial: 增量翻译 — 只翻译新增部分，追加到已有翻译。
+    def _save_partial_snapshot(self, key: str, *, source_text: str,
+                               translated_text: str, completed: bool,
+                               output_valid: bool, request_signature: str,
+                               translate_ms: float) -> None:
+        """业务目的：保存 partial 完成快照，供 final 在签名一致时复用。"""
+        self._partial_snapshots[key] = {
+            "source_text": source_text,
+            "translated_text": translated_text,
+            "completed": completed,
+            "output_valid": output_valid,
+            "request_signature": request_signature,
+            "translate_ms": translate_ms,
+        }
 
-        走流式路径：每个翻译 token 都立刻写一个 translation_partial
-        事件，macui 端按 token 浮现。整段 partial 同步保留，因为
-        legacy macui 端只看 cumulative。
-        """
+    def _do_partial(self, event, source_text, key, enqueued_ns=None,
+                    generation=None):
+        """Partial: 当前完整源文 → 完整译文流式；token 事件带累计全文，绝不 commit。"""
         if self.partial_cache.get(key, (None,))[0] == source_text:
+            return
+        if (self.priority_enabled and generation is not None
+                and generation != self._partial_generation.get(key)):
             return
 
         t = _format_time(event.get("audio_start_sec", 0))
         target_lang = resolve_target_lang(source_text, self.trans_state.target_lang)
-
-        # 获取上一次的状态
-        last_src, last_zh = self._partial_state.get(key, ("", ""))
-
-        # Track in-flight streaming state so the per-token callback
-        # can update partial_state on every chunk and the legacy
-        # 'full' value of any single token is always the cumulative
-        # translation (last_zh + this run's full).  Closed over by
-        # the streaming on_token callback below.
-        cumulative_zh = [last_zh]  # mutable box so on_token can mutate
+        cancel_ev = self._bind_cancel(key)
+        started_ns = time.monotonic_ns()
+        first_token_ns: list[int | None] = [None]
+        sig = ""
+        try:
+            sig = self.translator.build_request_signature(
+                source_text, target_lang=target_lang)
+        except Exception:
+            sig = ""
 
         def _on_token_streaming(piece: str, full: str) -> None:
-            # piece: 新增的 token；full: 本次翻译累计中文全文
-            # 我们要把 "last_zh + full" 写到 JSONL 让 macui 看到
-            # 完整的"已经看到的源文 → 翻译"映射。
-            #
-            # 同样检查 prompt leak：模型有时把 "只输出翻译结果..." 这种
-            # system prompt 当源文翻译出来。partial 也走 leak 检测，
-            # 命中就 drop partial（不写 JSONL），避免 macui 看到一堆
-            # "只输出翻译结果" 的 draft。
-            cumulative_zh = last_zh + full
-            _, leak_hit = _strip_prompt_leak(cumulative_zh)
+            # 每个 token 带完整累计译文；不写 zh/bi（不 commit）
+            if first_token_ns[0] is None:
+                first_token_ns[0] = time.monotonic_ns()
+            if cancel_ev.is_set():
+                raise TranslationCancelled("token callback cancelled")
+            cleaned, leak_hit = _strip_prompt_leak(full)
             if leak_hit:
                 return
-            self._partial_state[key] = (source_text, cumulative_zh)
-            self.partial_cache[key] = (source_text, cumulative_zh)
+            self.partial_cache[key] = (source_text, cleaned)
             ev = {
                 "event_type": "translation_partial",
                 "source_key": key,
                 "source_text": source_text,
-                "translated_full_text": last_zh + full,
+                "translated_full_text": cleaned,
                 "is_streaming_token": True,
                 "streaming_piece": piece,
+                "translation_enqueued_mono_ns": enqueued_ns,
+                "translation_request_started_mono_ns": started_ns,
+                "translation_first_token_mono_ns": first_token_ns[0],
             }
             with self.out_lock:
                 self.f_trans.write(json.dumps(ev, ensure_ascii=False) + "\n")
                 self.f_trans.flush()
 
-        if last_src and source_text.startswith(last_src):
-            # 纯追加：新文本以旧文本为前缀，只翻译新增部分
-            delta_src = source_text[len(last_src):]
-            if not delta_src.strip():
-                return
-            try:
-                _log_glossary_hits(self.translator, delta_src, target_lang)
-                full_zh, ms, _meta = self.translator.translate_delta_streaming(
-                    delta_src,
-                    prev_source_tail=last_src[-40:],
-                    prev_target_tail=last_zh[-20:],
-                    on_token=_on_token_streaming,
-                    target_lang=target_lang,
-                )
-            except Exception as exc:
-                print(f"\n[partial] delta 翻译失败: {exc}", flush=True)
-                # H10 修:发空 partial 事件,让 macui 清掉旧 draft ——
-                # 否则流式推到一半的 partial 永远留在 UI,用户看到死文本。
-                self._write_failed_partial(key, source_text)
-                return
-            if _is_explanation(full_zh):
-                return
-            # 追加到已有翻译
-            final_zh = last_zh + full_zh
-        else:
-            # 源文本变化较大，全量翻译（少见）—— 也走流式
-            try:
-                _log_glossary_hits(self.translator, source_text, target_lang)
-                full_zh, ms = self.translator.translate_streaming(
-                    source_text,
-                    on_token=_on_token_streaming,
-                    target_lang=target_lang,
-                )
-            except Exception as exc:
-                print(f"\n[partial] 全量翻译失败: {exc}", flush=True)
-                # 同上,失败时给 UI 发空 partial 清掉旧 draft。
-                self._write_failed_partial(key, source_text)
-                return
-            if _is_explanation(full_zh):
-                return
-            final_zh = full_zh
+        try:
+            _log_glossary_hits(self.translator, source_text, target_lang)
+            # 主路径一律全量流式；不再对 partial 调用 translate_delta_streaming
+            full_zh, ms = self.translator.translate_streaming(
+                source_text,
+                on_token=_on_token_streaming,
+                target_lang=target_lang,
+                cancel_check=cancel_ev.is_set,
+            )
+        except TranslationCancelled:
+            self._save_partial_snapshot(
+                key, source_text=source_text, translated_text="",
+                completed=False, output_valid=False,
+                request_signature=sig, translate_ms=0.0,
+            )
+            return
+        except Exception as exc:
+            print(f"\n[partial] 全量翻译失败: {exc}", flush=True)
+            self._write_failed_partial(key, source_text)
+            self._save_partial_snapshot(
+                key, source_text=source_text, translated_text="",
+                completed=False, output_valid=False,
+                request_signature=sig, translate_ms=0.0,
+            )
+            return
+        finally:
+            self._unbind_cancel(key, cancel_ev)
 
-        # 关键：流式过程中已经写过 N 个 token 事件了（每个 token
-        # 一次 translation_partial），不要在 _do_partial 末尾再
-        # 写一次 cumulative 整段 — 那样会盖掉最后一个流式事件。
-        # _do_final 看到 streaming token 之后会用最终 cumulative
-        # 写 final 事件。cumulative_zh 已经在 _on_token_streaming
-        # 末尾设过 last_zh + full 等于 final_zh 的"完整版"了。
+        completed_ns = time.monotonic_ns()
+        cleaned_zh, leak_hit = _strip_prompt_leak(full_zh)
+        bad = _is_explanation(cleaned_zh) or leak_hit or not cleaned_zh.strip()
+        output_valid = not bad
+        self._save_partial_snapshot(
+            key,
+            source_text=source_text,
+            translated_text=cleaned_zh if output_valid else "",
+            completed=True,
+            output_valid=output_valid,
+            request_signature=sig,
+            translate_ms=float(ms),
+        )
+        if bad:
+            return
 
-        # 但要 stdout 显示最新状态
+        # 补一条带完成时间戳的 partial（不 commit）
+        done_ev = {
+            "event_type": "translation_partial",
+            "source_key": key,
+            "source_text": source_text,
+            "translated_full_text": cleaned_zh,
+            "is_streaming_token": False,
+            "translation_enqueued_mono_ns": enqueued_ns,
+            "translation_request_started_mono_ns": started_ns,
+            "translation_first_token_mono_ns": first_token_ns[0],
+            "translation_completed_mono_ns": completed_ns,
+        }
         with self.out_lock:
-            sys.stdout.write(f"\r\033[K[partial][{t}] {final_zh}")
+            self.f_trans.write(json.dumps(done_ev, ensure_ascii=False) + "\n")
+            self.f_trans.flush()
+            sys.stdout.write(f"\r\033[K[partial][{t}] {cleaned_zh}")
             sys.stdout.flush()
 
-    def _do_final(self, event, source_text, key):
-        """Final: 永远全量重译，不信任 partial_cache。
+    def _can_reuse_partial(self, key: str, source_text: str,
+                           target_lang: str) -> dict | None:
+        """业务目的：判断 final 能否复用已完成且签名一致的 partial 快照。"""
+        snap = self._partial_snapshots.get(key)
+        if not snap:
+            return None
+        if not snap.get("completed") or not snap.get("output_valid"):
+            return None
+        if snap.get("source_text") != source_text:
+            return None
+        zh = (snap.get("translated_text") or "").strip()
+        if not zh or _is_explanation(zh):
+            return None
+        cleaned, leak_hit = _strip_prompt_leak(zh)
+        if leak_hit or not cleaned.strip():
+            return None
+        try:
+            cur_sig = self.translator.build_request_signature(
+                source_text, target_lang=target_lang)
+        except Exception:
+            return None
+        if snap.get("request_signature") != cur_sig:
+            return None
+        return {**snap, "translated_text": cleaned}
 
-        设计原则（2026-06-28 修复）：partial 是草稿（实时流式显示用,可以错）,
-        final 是正式字幕（必须正确）。Partial 用 prev_source_tail(40字) +
-        prev_target_tail(20字) 小窗口增量翻,LLM 上下文不足会幻觉。
-        Final 时拿完整 source 重译,partial 错了就覆盖。
-
-        兜底: 全量重译失败时,如果 partial_cache 还在,退回用 partial (它错了
-        也比没字幕强)。这个 fallback 用 fallback_reason 标记方便调试。
-        """
-        # 1. 取出 partial_cache (即使不用也清掉,避免下次 final 还命中)
+    def _do_final(self, event, source_text, key, enqueued_ns=None):
+        """Final: 签名+源文一致且 partial 正常完成时复用；否则全量重译。"""
         cached_entry = self.partial_cache.pop(key, None)
-        had_cached_partial = cached_entry is not None
-        # cached_entry 格式: (cached_src, cached_zh) — 但 _partial_state 里
-        # 才是最新的 last_src/last_zh(partial 一直更新到最后一刻)。
-        # _partial_state 在 partial 期间被 _on_token_streaming 持续刷新,
-        # 比 partial_cache 更新。用它做兜底匹配。
-        last_src, last_zh = self._partial_state.get(key, ("", ""))
-
-        # 2. 全量重译 source_text
         target_lang = resolve_target_lang(source_text, self.trans_state.target_lang)
+        started_ns = time.monotonic_ns()
+        first_token_ns = None
+        completed_ns = None
+
+        reused = self._can_reuse_partial(key, source_text, target_lang)
+        self._partial_snapshots.pop(key, None)
+
+        if reused is not None:
+            zh = reused["translated_text"]
+            partial_ms = float(reused.get("translate_ms") or 0.0)
+            completed_ns = time.monotonic_ns()
+            self.trans_state.last_source_text = source_text
+            self.trans_state.last_translated_text = zh
+            self.trans_state.last_source_key = key
+            self.counts["translated"] += 1
+            return {
+                "event_type": "translation_final",
+                "source_key": key,
+                "source_update_mode": "final_reused_partial",
+                "source_text": source_text,
+                "delta_source_text": source_text,
+                "translated_delta_text": zh,
+                "translated_full_text": zh,
+                "translate_ms": 0,
+                "partial_translate_ms": round(partial_ms, 1),
+                "final_reused_partial": True,
+                "shared_prefix_len": 0,
+                "glossary_hits": [],
+                "retried": False,
+                "fallback_reason": "",
+                "translation_enqueued_mono_ns": enqueued_ns,
+                "translation_request_started_mono_ns": started_ns,
+                "translation_first_token_mono_ns": started_ns,
+                "translation_completed_mono_ns": completed_ns,
+            }
+
+        # 全量重译
         _log_glossary_hits(self.translator, source_text, target_lang)
         fallback_reason = ""
         zh = ""
         translate_ms = 0.0
+        cancel_ev = self._bind_cancel(key)
 
         try:
             zh, translate_ms = self.translator.translate(
                 source_text, target_lang=target_lang
             )
+            first_token_ns = time.monotonic_ns()  # 非流式：完成即首末 token
         except Exception as exc:
-            # 全量翻译失败 → 兜底用 partial 累积 (如果 source 一致)
             self.counts["errors"] += 1
-            if last_src == source_text and last_zh:
-                zh = last_zh
+            # 失败兜底：若仍有同文 partial 缓存则用之
+            if (cached_entry and cached_entry[0] == source_text
+                    and cached_entry[1]):
+                zh = cached_entry[1]
                 fallback_reason = f"full_translate_failed_use_partial: {exc}"
                 self.counts["fallbacks"] += 1
                 print(
@@ -617,10 +825,12 @@ class TranslateWorker:
                     flush=True,
                 )
             else:
+                self._unbind_cancel(key, cancel_ev)
                 return self._error_event(event, source_text, str(exc))
+        finally:
+            self._unbind_cancel(key, cancel_ev)
 
-        # 3. prompt leak 兜底: 全量翻译内部已剥 _strip_prompt_leak,
-        # 但翻译器偶尔漏过 — 再 check 一次整段,命中就 drop final。
+        completed_ns = time.monotonic_ns()
         cleaned_zh, leak_hit = _strip_prompt_leak(zh)
         if leak_hit:
             with self.out_lock:
@@ -633,41 +843,35 @@ class TranslateWorker:
             return None
         zh = cleaned_zh
 
-        # 4. 决定 source_update_mode — 调试用,UI 不依赖它。
-        # - full_translate: 没有 partial (first-final 或 partial 被丢)
-        # - full_translate_corrected_partial: 有 partial 且本次覆盖了它
-        if had_cached_partial and not fallback_reason:
-            mode = "full_translate_corrected_partial"
-        elif fallback_reason:
+        if fallback_reason:
             mode = "full_translate_failed_use_partial"
         else:
             mode = "full_translate"
 
-        # 5. 更新 trans_state 缓冲 — 下一个 final 的 delta 计算需要
         self.trans_state.last_source_text = source_text
         self.trans_state.last_translated_text = zh
         self.trans_state.last_source_key = key
-        # 同步清掉 _partial_state 这个 key — final 已落地,partial 状态归零
-        self._partial_state.pop(key, None)
         self.counts["translated"] += 1
 
-        out_event = {
+        return {
             "event_type": "translation_final",
             "source_key": key,
             "source_update_mode": mode,
             "source_text": source_text,
-            # delta_source_text / translated_delta_text 字段保留以兼容旧 UI,
-            # 但语义上是"本次重译覆盖了之前所有 partial",而非 delta。
             "delta_source_text": source_text,
             "translated_delta_text": zh,
             "translated_full_text": zh,
             "translate_ms": round(translate_ms, 1),
+            "final_reused_partial": False,
             "shared_prefix_len": 0,
             "glossary_hits": [],
             "retried": False,
             "fallback_reason": fallback_reason,
+            "translation_enqueued_mono_ns": enqueued_ns,
+            "translation_request_started_mono_ns": started_ns,
+            "translation_first_token_mono_ns": first_token_ns or completed_ns,
+            "translation_completed_mono_ns": completed_ns,
         }
-        return out_event
 
     def _write_failed_partial(self, key: str, source_text: str) -> None:
         """翻译失败时给 macui 发一个空 partial 事件,清掉 UI 上的旧 draft。
@@ -720,6 +924,17 @@ class TranslateWorker:
             self.f_bi.write(_bilingual_line(event, zh_full))
             self.f_bi.flush()
 
+    def _error_event(self, event, source_text, error_msg):
+        return {
+            "event_type": "translation_error",
+            "source_key": _source_key(event) if event else "",
+            "source_seg_start": event.get("seg_start") if event else None,
+            "source_seg_end": event.get("seg_end") if event else None,
+            "source_text": source_text,
+            "error": error_msg,
+            "retriable": True,
+        }
+
 
 # ── 状态管理 ────────────────────────────────────────────────────────────────────
 
@@ -767,8 +982,8 @@ def main():
     parser.add_argument("--glossary", default=os.path.join(os.path.dirname(__file__), "glossary.json"))
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.6)
-    parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--repetition-penalty", type=float, default=1.02)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--poll-interval", type=float, default=0.05,
                         help="轮询间隔（秒，默认 0.05）")
     parser.add_argument("--max-new-tokens", type=int, default=80,
@@ -1037,12 +1252,16 @@ def main():
         等待模式下重连成功后由主循环补建。"""
         nonlocal worker
         if is_partial_mode and worker is None and translator is not None:
+            # 从 lang_config 读优先级队列开关（默认 True）
+            priority_enabled = bool(lang_cfg.get("translation_priority_enabled", True))
             worker = TranslateWorker(
                 translator, trans_state, partial_cache,
                 f_trans, f_zh, f_bi, out_lock, counts, is_partial_mode,
+                priority_enabled=priority_enabled,
             )
             worker.start()
-            print("[translate] 同声传译模式（增量翻译 + 异步线程）", flush=True)
+            print(f"[translate] 同声传译模式（增量翻译 + 异步线程, "
+                  f"priority={priority_enabled}）", flush=True)
 
     _start_worker()
 
