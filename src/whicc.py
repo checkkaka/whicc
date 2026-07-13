@@ -296,17 +296,21 @@ def _warmup_model(model_path: str, which: str) -> None:
 
 def do_transcribe(audio, language: str = "en",
                   model: str = DEFAULT_MODEL,
-                  backend: str = "nemotron") -> dict:
+                  backend: str = "nemotron",
+                  nemotron_right_context: int = 13) -> dict:
     """转录（非流式）。backend: 'nemotron' 或 'qwen3'。
 
     audio: WAV 路径(str) 或 float32 mono 16kHz 的 np.ndarray —
     两个后端的 generate 都原生支持数组输入(Nemotron 收 mx.array,
     Qwen3 直接收 ndarray),数组直传省掉"每次推理先写 WAV 再读回"
     的磁盘往返(探针每 0.6s 一次)。
+    nemotron_right_context: look-ahead 档位 3/6/13，对应 att_context_size。
     """
     if backend == "qwen3":
         return _do_transcribe_qwen3(audio, language=language, model_path=model)
-    return _do_transcribe_nemotron(audio, language=language, model_path=model)
+    return _do_transcribe_nemotron(
+        audio, language=language, model_path=model,
+        right_context=nemotron_right_context)
 
 
 def _do_transcribe_qwen3(audio, language: str = "en", model_path: str = "") -> dict:
@@ -388,16 +392,25 @@ def _get_nemotron_model(model_path: str):
 
 
 def _do_transcribe_nemotron(audio, language: str = "en",
-                            model_path: str = "") -> dict:
+                            model_path: str = "",
+                            right_context: int = 13) -> dict:
     """Nemotron ASR 转录（非流式）。language='auto' 或空时自动检测。
     audio: WAV 路径或 float32 16kHz ndarray(generate 收 mx.array,
-    ndarray 在这里转一层 — mx.array 包装零拷贝级开销)。"""
+    ndarray 在这里转一层 — mx.array 包装零拷贝级开销)。
+    right_context: look-ahead 帧数，写入 att_context_size=[56, n]。
+    """
     m = _get_nemotron_model(model_path)
     if isinstance(audio, np.ndarray):
         import mlx.core as mx
         audio = mx.array(audio)
     lang_param = None if language in ("auto", "") else language
-    r = m.generate(audio, language=lang_param)
+    if right_context not in (3, 6, 13):
+        right_context = 13
+    # 批处理路径也按档位设置 look-ahead，与原生流式配置一致
+    if hasattr(m, "default_att_context_size"):
+        m.default_att_context_size = [56, right_context]
+    r = m.generate(audio, language=lang_param,
+                   att_context_size=[56, right_context])
     text = r.text.strip() if r.text else ""
     sentences = r.sentences if hasattr(r, 'sentences') else []
     avg_lp = -0.3
@@ -1155,6 +1168,30 @@ def main():
     print("模型就绪。启动系统音频捕获...\n", flush=True)
     logger.log_status("ready")
 
+    # Nemotron 原生流式：开关开启且当前后端为 nemotron 时启用；失败自动回退批处理探针
+    nemotron_stream = None
+    use_native_stream = False
+    if native_streaming_enabled and resolved_backend == "nemotron":
+        try:
+            from nemotron_stream import NemotronStream
+            # 调用已加载模型：构造跨 PCM 持久流式包装
+            _ns_model = _get_nemotron_model(resolved_model)
+            if hasattr(_ns_model, "default_att_context_size"):
+                _ns_model.default_att_context_size = [56, args.nemotron_right_context]
+            nemotron_stream = NemotronStream(
+                model=_ns_model,
+                language=args.language,
+                right_context=args.nemotron_right_context,
+            )
+            use_native_stream = True
+            print(f"[nemotron-stream] enabled [56,{args.nemotron_right_context}]",
+                  flush=True)
+        except Exception as e:
+            print(f"[nemotron-stream] 初始化失败，回退批处理探针: {e}",
+                  file=sys.stderr, flush=True)
+            nemotron_stream = None
+            use_native_stream = False
+
     text_out = open(args.output_text, "w", encoding="utf-8") if args.output_text else None
 
     metrics = Metrics(args.stats)
@@ -1265,6 +1302,7 @@ def main():
             )
             if need_swap:
                 _swap_audio_source(new_mode, bundle_id, display_name)
+                reset_native_stream("audio source swap")
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
             logger.log_status(f"audio swap: bad config: {e}")
 
@@ -1318,6 +1356,51 @@ def main():
         source_sequence += 1
         source_revision = SourceRevision(f"{args.run_id}:{source_sequence}")
 
+    def disable_native_stream(reason: str) -> None:
+        """流式失败/切到 Qwen：关闭原生流并回退批处理探针。"""
+        nonlocal nemotron_stream, use_native_stream
+        if use_native_stream or nemotron_stream is not None:
+            print(f"[nemotron-stream] disabled: {reason}", file=sys.stderr, flush=True)
+        nemotron_stream = None
+        use_native_stream = False
+
+    def reset_native_stream(reason: str = "") -> None:
+        """音频源切换/丢帧：重置流状态但不关闭开关。"""
+        if nemotron_stream is not None:
+            # 业务目的：切源后旧 encoder/RNNT 缓存失效，必须清空
+            nemotron_stream.reset(language=args.language,
+                                  right_context=args.nemotron_right_context)
+            if reason:
+                print(f"[nemotron-stream] reset: {reason}", file=sys.stderr, flush=True)
+
+    def emit_probe_partial(text: str, seg_start: int, seg_end: int) -> None:
+        """探针/流式文本变化时写 is_probe partial。"""
+        nonlocal last_probe_text
+        if not probe_partial_enabled or not text or text == last_probe_text:
+            return
+        _ptxt = text.strip().rstrip(".!?")
+        _is_single_halluc = (
+            len(_ptxt) <= 4
+            and _ptxt.lower() in {
+                "the", "see", "you", "a", "oh", "so", "and", "but", "is"
+            }
+        )
+        if _is_single_halluc or not logger._f:
+            return
+        sk, rev = source_revision.update(text)
+        audio_start_sec = seg_start * SEG_DURATION_SEC
+        audio_end_sec = (seg_end + 1) * SEG_DURATION_SEC
+        logger.log_partial(
+            seg_start, seg_end,
+            audio_start_sec, audio_end_sec,
+            text,
+            source_key=sk,
+            revision=rev,
+            is_probe=True,
+            speech_start_mono_ns=speech_start_mono_ns,
+        )
+        last_probe_text = text
+
     def save_tail(samples: np.ndarray) -> np.ndarray:
         """返回 samples 末尾 overlap_samples 长度的片段；overlap_samples<=0 时返回空数组"""
         if overlap_samples <= 0:
@@ -1344,6 +1427,7 @@ def main():
                      precomputed_result: dict | None = None):
         nonlocal confirmed_text, tail_overlap, tail_buffer, resolved_model, resolved_backend, zh_streak, ja_streak, en_streak, pending_switch
         nonlocal source_revision, speech_start_mono_ns, last_probe_text
+        nonlocal nemotron_stream, use_native_stream
 
         chunk_sec = len(samples) / SAMPLE_RATE
         audio_start_sec = seg_start * SEG_DURATION_SEC
@@ -1382,7 +1466,11 @@ def main():
                 result = do_transcribe(samples,
                                        language=args.language,
                                        model=resolved_model,
-                                       backend=resolved_backend)
+                                       backend=resolved_backend,
+                                       nemotron_right_context=(
+                                           13 if resolved_backend != "nemotron"
+                                           else args.nemotron_right_context
+                                       ))
             t_infer_end = time.monotonic()
             transcribe_ms = (t_infer_end - t_infer_start) * 1000
 
@@ -1468,6 +1556,8 @@ def main():
                             import gc; gc.collect()
                         resolved_model = qwen3_path
                         resolved_backend = "qwen3"
+                        # Qwen3 无 Nemotron 流式状态，必须关闭
+                        disable_native_stream("switched to qwen3")
                         logger.log_status("已切换到 Qwen3 ASR", status_color="green")
                     elif pending_switch == "to_nemotron":
                         if not args.dual_model:
@@ -1475,6 +1565,25 @@ def main():
                             import gc; gc.collect()
                         resolved_model = nemotron_model
                         resolved_backend = "nemotron"
+                        # 切回 Nemotron：若配置允许则重建流式包装
+                        if native_streaming_enabled:
+                            try:
+                                from nemotron_stream import NemotronStream
+                                _ns_model = _get_nemotron_model(resolved_model)
+                                if hasattr(_ns_model, "default_att_context_size"):
+                                    _ns_model.default_att_context_size = [
+                                        56, args.nemotron_right_context
+                                    ]
+                                nemotron_stream = NemotronStream(
+                                    model=_ns_model,
+                                    language=args.language,
+                                    right_context=args.nemotron_right_context,
+                                )
+                                use_native_stream = True
+                                print("[nemotron-stream] re-enabled after switch",
+                                      flush=True)
+                            except Exception as e:
+                                disable_native_stream(f"re-init failed: {e}")
                         logger.log_status("已切换回 Nemotron ASR", status_color="green")
                     print(f"[lang-switch] 模型加载完成，已切换", file=sys.stderr, flush=True)
                     pending_switch = None
@@ -1492,6 +1601,7 @@ def main():
                     _get_qwen3_model(qwen3_path)
                 resolved_model = qwen3_path
                 resolved_backend = "qwen3"
+                disable_native_stream("switched to qwen3 (ja)")
                 logger.log_status("检测到日文，已切换到 Qwen3", status_color="green")
                 ja_streak = 0
                 en_streak = 0
@@ -1514,6 +1624,7 @@ def main():
                             print(f"[lang-switch] warmup 失败: {e}", file=sys.stderr, flush=True)
                     resolved_model = qwen3_path
                     resolved_backend = "qwen3"
+                    disable_native_stream("switched to qwen3 (zh)")
                     logger.log_status("已切换到 Qwen3 ASR", status_color="green")
                     zh_streak = 0
                     en_streak = 0
@@ -1533,6 +1644,22 @@ def main():
                     print(f"[lang-switch] 检测到英文，切换回 Nemotron", file=sys.stderr, flush=True)
                     resolved_model = nemotron_model
                     resolved_backend = "nemotron"
+                    if native_streaming_enabled:
+                        try:
+                            from nemotron_stream import NemotronStream
+                            _ns_model = _get_nemotron_model(resolved_model)
+                            if hasattr(_ns_model, "default_att_context_size"):
+                                _ns_model.default_att_context_size = [
+                                    56, args.nemotron_right_context
+                                ]
+                            nemotron_stream = NemotronStream(
+                                model=_ns_model,
+                                language=args.language,
+                                right_context=args.nemotron_right_context,
+                            )
+                            use_native_stream = True
+                        except Exception as e:
+                            disable_native_stream(f"re-init failed: {e}")
                     logger.log_status("已切换回 Nemotron ASR", status_color="green")
                 else:
                     print(f"[lang-switch] 检测到英文，异步加载 Nemotron", file=sys.stderr, flush=True)
@@ -1682,11 +1809,41 @@ def main():
             chunk_sec = collected_count / SAMPLE_RATE
             seg_end = samples_ingested // SAMPLE_RATE  # 当前虚拟段号(累计秒)
 
-            # ---- 探针 ASR: 累积够 MIN_CHUNK_SEC (2s) 就跑,持续刷新 sm_text ----
-            # 触发器 (punct_end) 看 sm_text 是否包含完整句末标点 — 当前 ASR 看到的
-            # 真实文本,而不是"上一段 final 的标点"。这样能避免切半句话。
-            # 软最大值切割在下面单独判断,共用 sm_text 缓存不重复跑推理。
-            if chunk_sec >= MIN_CHUNK_SEC and has_speech:
+            # ---- ASR 文本刷新：原生流式优先，否则批处理探针 ----
+            # 原生流式：按 Nemotron 原生 chunk 喂 PCM，MIN_CHUNK_SEC=2.0 不适用。
+            # 批处理探针：累积 ≥2s 后每 0.6s 整段重识别（旧路径，可回退）。
+            stream_updated = False
+            if use_native_stream and nemotron_stream is not None and has_speech:
+                try:
+                    for samples in new_arrays:
+                        # 调用 NemotronStream.feed：增量识别累计文本
+                        snap = nemotron_stream.feed(samples)
+                        if snap is None or not snap.changed or not snap.text:
+                            continue
+                        sm_text = snap.text.strip()
+                        sm_audio = np.concatenate(collected) if collected else np.array([], dtype=np.float32)
+                        sm_result = {
+                            "text": sm_text,
+                            "language": sm_language,
+                            "avg_logprob": -0.3,
+                            "avg_compression": 0.0,
+                            "no_speech_prob": 0.0,
+                            "segments": [],
+                        }
+                        # 从文本粗判语言，供分语言断句阈值使用
+                        cjk_count = sum(1 for c in sm_text if "一" <= c <= "鿿")
+                        sm_language = "zh" if cjk_count > max(3, len(sm_text) * 0.3) else "en"
+                        sm_result["language"] = sm_language
+                        soft_max_last_asr = time.monotonic()
+                        stream_updated = True
+                        emit_probe_partial(sm_text, chunk_first_seg, seg_end)
+                except Exception as e:
+                    print(f"[nemotron-stream] feed 失败，回退探针: {e}",
+                          file=sys.stderr, flush=True)
+                    disable_native_stream(f"feed error: {e}")
+
+            if (not stream_updated and not use_native_stream
+                    and chunk_sec >= MIN_CHUNK_SEC and has_speech):
                 need_asr = sm_text is None or (time.monotonic() - soft_max_last_asr) >= SOFT_MAX_ASR_COOLDOWN
                 if need_asr:
                     all_sm = np.concatenate(collected)
@@ -1697,7 +1854,11 @@ def main():
                         result_sm = do_transcribe(all_sm,
                                                   language=args.language,
                                                   model=resolved_model,
-                                                  backend=resolved_backend)
+                                                  backend=resolved_backend,
+                                                  nemotron_right_context=(
+                                                      13 if resolved_backend != "nemotron"
+                                                      else args.nemotron_right_context
+                                                  ))
                         sm_text = result_sm.get("text", "").strip()
                         sm_segments = result_sm.get("segments")
                         sm_result = result_sm  # 完整 dict,submit 音频一致时复用
@@ -1713,29 +1874,8 @@ def main():
                             sm_text = None
                             sm_result = None
                             sm_audio = np.array([], dtype=np.float32)
-                        elif probe_partial_enabled and sm_text != last_probe_text:
-                            # 探针文本变化：立即下发 is_probe partial，供 UI/翻译草稿
-                            _ptxt = sm_text.strip().rstrip(".!?")
-                            _is_single_halluc = (
-                                len(_ptxt) <= 4
-                                and _ptxt.lower() in {
-                                    "the", "see", "you", "a", "oh", "so", "and", "but", "is"
-                                }
-                            )
-                            if not _is_single_halluc and logger._f:
-                                sk, rev = source_revision.update(sm_text)
-                                audio_start_sec = chunk_first_seg * SEG_DURATION_SEC
-                                audio_end_sec = (seg_end + 1) * SEG_DURATION_SEC
-                                logger.log_partial(
-                                    chunk_first_seg, seg_end,
-                                    audio_start_sec, audio_end_sec,
-                                    sm_text,
-                                    source_key=sk,
-                                    revision=rev,
-                                    is_probe=True,
-                                    speech_start_mono_ns=speech_start_mono_ns,
-                                )
-                                last_probe_text = sm_text
+                        else:
+                            emit_probe_partial(sm_text, chunk_first_seg, seg_end)
                     except Exception as e:
                         print(f"[probe-asr] ASR 异常: {e}", file=sys.stderr, flush=True)
                         sm_text = None
@@ -1779,7 +1919,13 @@ def main():
                                  submit_reason="punct_split",
                                  speech_sec=speech_accumulated,
                                  trailing_silence_sec=silence_streak,
-                                 overlap_applied=False)  # 不加 overlap: 已经精确切到标点位置
+                                 overlap_applied=False,
+                                 precomputed_result=sm_result if (
+                                     use_native_stream and sm_result is not None
+                                 ) else None)  # 不加 overlap: 已经精确切到标点位置
+                    if use_native_stream and nemotron_stream is not None:
+                        # 业务目的：断句后提交边界前文本，保留边界后流状态
+                        nemotron_stream.commit_through(split_sec)
                     soft_max_remainder = remainder_audio
                     collected = []
                     collected_count = 0
@@ -1831,7 +1977,13 @@ def main():
                                  submit_reason=reason,
                                  speech_sec=speech_accumulated,
                                  trailing_silence_sec=silence_streak,
-                                 overlap_applied=is_full and len(tail_overlap) > 0)
+                                 overlap_applied=is_full and len(tail_overlap) > 0,
+                                 precomputed_result=sm_result if (
+                                     use_native_stream and sm_result is not None
+                                 ) else None)
+                    if use_native_stream and nemotron_stream is not None:
+                        # 业务目的：软切后提交边界前文本，保留剩余流状态
+                        nemotron_stream.commit_through(split_sec)
                     soft_max_remainder = remainder_audio if not is_full else np.array([], dtype=np.float32)
                     collected = []
                     collected_count = 0
@@ -1927,6 +2079,14 @@ def main():
                              trailing_silence_sec=cur_trailing,
                              overlap_applied=overlap_applied,
                              precomputed_result=reuse_result)
+                if use_native_stream and nemotron_stream is not None:
+                    # 业务目的：整句提交后冲刷并重置流状态，开始下一句
+                    try:
+                        nemotron_stream.finalize()
+                    except Exception:
+                        pass
+                    nemotron_stream.reset(language=args.language,
+                                          right_context=args.nemotron_right_context)
 
             elif should_discard:
                 # 纯静音，丢弃但保留尾部 overlap
