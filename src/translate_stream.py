@@ -28,7 +28,7 @@ from queue import Queue, Empty
 
 from translator_hy_mt2 import (
     HyMT2Translator, classify_update, detect_language, detect_glossary_hits,
-    set_scene_context, _strip_prompt_leak,
+    set_scene_context, get_scene_context, _strip_prompt_leak,
 )
 from languages import normalize_target_language, TargetLanguage
 
@@ -52,6 +52,23 @@ def _atomic_write_json(path: str, obj) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def read_user_scene(out_dir: str) -> str:
+    """从 lang_config.json 读取用户手填的翻译场景（键名 `scene`）。
+
+    与 event_agent.clear_event / macui LangConfig.sceneText 约定一致。
+    文件缺失、键缺失或非字符串时返回空串。
+    捕 ValueError 覆盖 JSONDecodeError 与编码损坏的 UnicodeDecodeError。
+    """
+    path = os.path.join(out_dir, "lang_config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        scene = cfg.get("scene", "")
+        return scene.strip() if isinstance(scene, str) else ""
+    except (OSError, ValueError, TypeError):
+        return ""
 
 
 # ── 输出过滤 ────────────────────────────────────────────────────────────────────
@@ -787,6 +804,13 @@ def main():
         pass
     configured_url = (lang_cfg.get("translation_url") or "").strip()
     configured_fb = (lang_cfg.get("translation_fallback_url") or "").strip()
+    # 启动时加载手填场景（事件临时场景稍后由热重载覆盖）
+    _startup_scene = (lang_cfg.get("scene") or "").strip() if isinstance(lang_cfg.get("scene"), str) else ""
+    if _startup_scene:
+        set_scene_context(_startup_scene)
+        print(f"[translate] 手填场景已加载: {_startup_scene[:40]}", flush=True)
+    else:
+        set_scene_context("")
     # 优先级: lang_config.json (用户 UI 配) > CLI 参数
     # 现在 CLI 默认值是 "" 空串,
     # 用户没在 UI 配翻译节点 → vllm_url = "", 下面 candidates 是空,
@@ -1125,6 +1149,16 @@ def main():
                 tl = normalize_target_language(new_lang)
                 trans_state.target_lang = tl.prompt_name
                 print(f"[translate] 目标语言切换: {tl.prompt_name} ({tl.code})", flush=True)
+            # 手填场景热重载：事件激活期间不覆盖临时事件场景
+            if not _event_active:
+                new_scene = cfg.get("scene", "")
+                new_scene = new_scene.strip() if isinstance(new_scene, str) else ""
+                if new_scene != get_scene_context():
+                    set_scene_context(new_scene)
+                    if new_scene:
+                        print(f"[translate] 手填场景切换: {new_scene[:40]}", flush=True)
+                    else:
+                        print("[translate] 手填场景已清空", flush=True)
             _last_lang_config_mtime = mtime
         except Exception as exc:
             print(f"[translate] 语言配置加载失败: {exc}", flush=True)
@@ -1208,10 +1242,10 @@ def main():
                 try:
                     exp = datetime.datetime.fromisoformat(expires_at)
                     if datetime.datetime.now() > exp:
-                        # TTL 过期，清除事件，直接恢复 base glossary
+                        # TTL 过期，清除事件，恢复用户手填场景 + base glossary
                         print(f"[event] 事件 '{event_name}' TTL 过期，清除场景", flush=True)
                         _event_active = False
-                        set_scene_context("")
+                        set_scene_context(read_user_scene(args.out_dir))
                         translator.glossary = {"en2zh": dict(_base_glossary.get("en2zh", {})),
                                                "zh2en": dict(_base_glossary.get("zh2en", {}))}
                         return
@@ -1223,7 +1257,8 @@ def main():
         elif status == "idle":
             if _event_active:
                 _event_active = False
-                set_scene_context("")
+                # 调用恢复手填场景：事件清除后回落 lang_config.scene，而非清空
+                set_scene_context(read_user_scene(args.out_dir))
                 translator.glossary = {"en2zh": dict(_base_glossary.get("en2zh", {})),
                                        "zh2en": dict(_base_glossary.get("zh2en", {}))}
                 print(f"[event] 事件已清除", flush=True)

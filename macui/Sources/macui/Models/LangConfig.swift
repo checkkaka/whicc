@@ -49,6 +49,10 @@ final class LangConfig: ObservableObject {
     /// 开这个;海外网络保持关闭(直连更快)。下一次下载即生效。
     @Published var hfMirrorEnabled: Bool = false
     @Published var hermesHost: String = ""
+    /// 用户手填的翻译场景描述，写入 lang_config.json 的 `scene` 键。
+    /// translate_stream 热重载后注入 Hy-MT2 prompt；留空则不注入。
+    /// 与 Hermes 事件临时场景独立：事件激活时临时场景优先，清除后回落本字段。
+    @Published var sceneText: String = ""
     /// Subtitle font choice — persisted but owned by `OverlayState`
     /// (UI binds to `state.fontChoice`). `LangConfig` just stores the
     /// raw string so we can round-trip the value through
@@ -237,6 +241,12 @@ final class LangConfig: ObservableObject {
 
     func setHermesHost(_ host: String) {
         hermesHost = host
+        save()
+    }
+
+    /// 调用写盘：更新手填翻译场景并立即持久化到 lang_config.json。
+    func setScene(_ scene: String) {
+        sceneText = scene
         save()
     }
 
@@ -543,6 +553,8 @@ final class LangConfig: ObservableObject {
             // 这样老用户升级后行为不会突变。
             self.translationEnabled = (json["translation_enabled"] as? Bool) ?? false
             self.assignIfChanged(\.hermesHost, (json["hermes_host"] as? String) ?? "")
+            // scene: 手填翻译场景；与 event_agent.clear_event 读写的键名一致。
+            self.assignIfChanged(\.sceneText, (json["scene"] as? String) ?? "")
             if let font = json["subtitle_font"] as? String { self.subtitleFont = font }
             if let fav = json["favorite_fonts"] as? [String] { self.favoriteFonts = fav }
             // audio_source: "system" | "mic" | "application"。旧配置无此键时默认 "system"。
@@ -586,6 +598,7 @@ final class LangConfig: ObservableObject {
         self.hfMirrorEnabled = (json["hf_mirror_enabled"] as? Bool) ?? false
         self.translationEnabled = (json["translation_enabled"] as? Bool) ?? false
         self.hermesHost = (json["hermes_host"] as? String) ?? ""
+        self.sceneText = (json["scene"] as? String) ?? ""
         if let font = json["subtitle_font"] as? String { self.subtitleFont = font }
         if let fav = json["favorite_fonts"] as? [String] { self.favoriteFonts = fav }
         if let src = json["audio_source"] as? String { self.audioSource = src }
@@ -604,8 +617,8 @@ final class LangConfig: ObservableObject {
     }
 
     private func save() {
-        // 先读出现有内容，把不属于 LangConfig 的字段（比如 ScenePane 写的
-        // scene_text）保留下来，再覆盖 LangConfig 自己负责的 6 个键。
+        // 先读出现有内容，把不属于 LangConfig 的字段保留下来，再覆盖
+        // LangConfig 自己负责的键（含 scene 手填翻译场景）。
         // 之前是直接写一个 4 键的字典，会把文件里其他键全删掉。
         // 注：字典类型从 [String: String] 升级到 [String: Any]，因为
         // translation_enabled 是 Bool。读时尝试 Any，保留任何已有的
@@ -635,6 +648,7 @@ final class LangConfig: ObservableObject {
         json["hf_mirror_enabled"] = hfMirrorEnabled
         json["translation_enabled"] = translationEnabled
         json["hermes_host"] = hermesHost
+        json["scene"] = sceneText
         json["subtitle_font"] = subtitleFont
         json["favorite_fonts"] = favoriteFonts
         json["audio_source"] = audioSource
