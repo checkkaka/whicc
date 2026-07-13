@@ -116,6 +116,9 @@
 "「外置算力优先」: 远端不可达时自动回退到下方配置的「本机翻译回退地址」,无需手动干预" = "\"External priority\": when remote is unreachable, fall back to the \"Local fallback\" address below — no manual intervention needed.";
 
 "翻译节点" = "Translation node";
+"翻译场景" = "Translation scene";
+"如 AI访谈 / NBA总决赛" = "e.g. AI interview / NBA Finals";
+"注入翻译 prompt，帮助模型理解上下文；留空不注入。改完后数秒内生效，无需重启。" = "Injected into the translation prompt to give the model context. Leave empty to skip. Takes effect within seconds — no restart needed.";
 "如 127.0.0.1:1234" = "e.g. 127.0.0.1:1234";
 "如 192.168.1.5:1234" = "e.g. 192.168.1.5:1234";
 "检测翻译回退节点" = "Test fallback node";
