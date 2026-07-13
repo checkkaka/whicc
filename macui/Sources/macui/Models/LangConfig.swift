@@ -68,6 +68,9 @@ final class LangConfig: ObservableObject {
     @Published var audioAppBundleId: String = ""
     /// 指定应用模式的展示名（UI 用；解析失败时回退 Bundle ID）。
     @Published var audioAppDisplayName: String = ""
+    /// Nemotron look-ahead 档位：仅允许 3/6/13，默认 6（560ms 均衡）。
+    /// 改档后需重启 whicc.py（encoder cache / RNNT 状态不可热切换）。
+    @Published var nemotronRightContext: Int = 6
     /// 用户收藏的字体（rawValue 列表）。HUD 的 A 按钮在 [.rounded, .serif]
     /// + 用户收藏 的合集里循环——默认两个永远在合集里,确保 HUD
     /// 至少有 2 个可切项。空列表 = 仅循环两个默认。
@@ -236,6 +239,13 @@ final class LangConfig: ObservableObject {
 
     func setHfMirrorEnabled(_ enabled: Bool) {
         hfMirrorEnabled = enabled
+        save()
+    }
+
+    /// 设置 Nemotron look-ahead 档位并写盘；调用方负责重启 ASR 后端。
+    func setNemotronRightContext(_ value: Int) {
+        let normalized = [3, 6, 13].contains(value) ? value : 6
+        nemotronRightContext = normalized
         save()
     }
 
@@ -561,6 +571,13 @@ final class LangConfig: ObservableObject {
             if let src = json["audio_source"] as? String { self.audioSource = src }
             self.assignIfChanged(\.audioAppBundleId, (json["audio_app_bundle_id"] as? String) ?? "")
             self.assignIfChanged(\.audioAppDisplayName, (json["audio_app_display_name"] as? String) ?? "")
+            // nemotron_right_context：非法值回退 6
+            if let v = json["nemotron_right_context"] as? Int, [3, 6, 13].contains(v) {
+                self.nemotronRightContext = v
+            } else if let n = json["nemotron_right_context"] as? NSNumber {
+                let v = n.intValue
+                self.nemotronRightContext = [3, 6, 13].contains(v) ? v : 6
+            }
             // 下面 4 个字段都是「外观默认值」,老配置不存在时用上面的
             // hard-coded 默认值,不会让旧用户的样式突变。
             if let color = json["subtitle_color"] as? String { self.subtitleColor = color }
@@ -604,6 +621,12 @@ final class LangConfig: ObservableObject {
         if let src = json["audio_source"] as? String { self.audioSource = src }
         self.audioAppBundleId = (json["audio_app_bundle_id"] as? String) ?? ""
         self.audioAppDisplayName = (json["audio_app_display_name"] as? String) ?? ""
+        if let v = json["nemotron_right_context"] as? Int, [3, 6, 13].contains(v) {
+            self.nemotronRightContext = v
+        } else if let n = json["nemotron_right_context"] as? NSNumber {
+            let v = n.intValue
+            self.nemotronRightContext = [3, 6, 13].contains(v) ? v : 6
+        }
         if let color = json["subtitle_color"] as? String { self.subtitleColor = color }
         if let hex = json["custom_color_hex"] as? String { self.customColorHex = hex }
         // 跟 load() 同款 `v >= 0`(接受合法的 0)
@@ -654,6 +677,7 @@ final class LangConfig: ObservableObject {
         json["audio_source"] = audioSource
         json["audio_app_bundle_id"] = audioAppBundleId
         json["audio_app_display_name"] = audioAppDisplayName
+        json["nemotron_right_context"] = nemotronRightContext
         json["subtitle_color"] = subtitleColor
         json["custom_color_hex"] = customColorHex
         json["trans_font_size"] = Double(transFontSize)

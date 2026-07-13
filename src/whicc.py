@@ -20,6 +20,7 @@ import threading
 import signal
 import queue as queue_mod
 from collections import Counter
+from dataclasses import dataclass
 import numpy as np
 
 # --------------- 配置 ---------------
@@ -338,7 +339,8 @@ def _do_transcribe_qwen3(audio, language: str = "en", model_path: str = "") -> d
     avg_nsp = 0.0 if text else 1.0
 
     return {"text": text, "language": lang, "avg_logprob": avg_lp,
-            "avg_compression": avg_cr, "no_speech_prob": avg_nsp}
+            "avg_compression": avg_cr, "no_speech_prob": avg_nsp,
+            "segments": _normalize_qwen_segments(segs)}
 
 
 
@@ -411,7 +413,44 @@ def _do_transcribe_nemotron(audio, language: str = "en",
         detected_lang = "zh" if cjk_count > max(3, len(text) * 0.3) else "en"
     return {"text": text, "language": detected_lang, "avg_logprob": avg_lp,
             "avg_compression": avg_cr, "no_speech_prob": avg_nsp,
+            "segments": sentences_to_segments(sentences),
             "sentences": sentences}
+
+
+def sentences_to_segments(sentences) -> list[dict]:
+    """把 Nemotron AlignedSentence 统一成 {text,start,end}，供切点使用。"""
+    out: list[dict] = []
+    for sent in sentences or []:
+        text = getattr(sent, "text", None)
+        if text is None and isinstance(sent, dict):
+            text = sent.get("text", "")
+            start = float(sent.get("start", 0.0) or 0.0)
+            end = float(sent.get("end", 0.0) or 0.0)
+        else:
+            start = float(getattr(sent, "start", 0.0) or 0.0)
+            end = float(getattr(sent, "end", 0.0) or 0.0)
+            text = text or ""
+        out.append({"text": text, "start": start, "end": end})
+    return out
+
+
+def _normalize_qwen_segments(segs) -> list[dict]:
+    """把 Qwen3 segments 规范为 {text,start,end}。"""
+    out: list[dict] = []
+    for seg in segs or []:
+        if isinstance(seg, dict):
+            out.append({
+                "text": seg.get("text", "") or "",
+                "start": float(seg.get("start", 0.0) or 0.0),
+                "end": float(seg.get("end", 0.0) or 0.0),
+            })
+            continue
+        out.append({
+            "text": getattr(seg, "text", "") or "",
+            "start": float(getattr(seg, "start", 0.0) or 0.0),
+            "end": float(getattr(seg, "end", 0.0) or 0.0),
+        })
+    return out
 
 
 # --------------- 语言检测 ---------------
@@ -468,10 +507,11 @@ SOFT_MAX_ASR_COOLDOWN = 0.6  # 软最大值 ASR 重试冷却（秒）
 
 def find_audio_split_sec(text: str, total_sec: float, segments: list | None = None,
                          punct_set: set | None = None,
-                         min_char_pos: int = 0) -> float:
+                         min_char_pos: int = 0) -> tuple[float, str]:
     """找到 text 中 min_char_pos 之后最后一个标点对应的音频时间位置（秒）。
     优先使用 ASR segments 时间戳（精确），否则按字符比例估算。
-    返回 0 表示没找到标点，不应分割。
+    返回 (秒, split_method)；秒为 0 表示没找到标点，不应分割。
+    split_method: 'segments' | 'char_ratio' | 'none'
     punct_set: 要搜索的标点集合，默认 SENTENCE_END_PUNCT
     min_char_pos: 忽略此位置之前的标点（避免切太短）
     """
@@ -483,7 +523,7 @@ def find_audio_split_sec(text: str, total_sec: float, segments: list | None = No
             last_punct_pos = i
             break
     if last_punct_pos < 0:
-        return 0.0
+        return 0.0, "none"
 
     # 方案 A: 用 ASR segments 时间戳 (精确)
     if segments:
@@ -493,14 +533,62 @@ def find_audio_split_sec(text: str, total_sec: float, segments: list | None = No
             seg_start = char_pos
             seg_end = char_pos + len(seg_text)
             if last_punct_pos >= seg_start and last_punct_pos < seg_end:
-                return seg.get("end", 0.0)
+                return float(seg.get("end", 0.0) or 0.0), "segments"
             char_pos = seg_end
         # fallback：标点在最后一个 segment
         if segments:
-            return segments[-1].get("end", total_sec)
+            return float(segments[-1].get("end", total_sec) or total_sec), "segments"
 
     # 方案 B：字符比例估算
-    return total_sec * (last_punct_pos + 1) / len(text)
+    return total_sec * (last_punct_pos + 1) / len(text), "char_ratio"
+
+
+@dataclass
+class SourceRevision:
+    """同一句的稳定 key 与仅在文本变化时递增的 revision。"""
+
+    source_key: str
+    revision: int = 0
+    _last_text: str = ""
+
+    def update(self, text: str) -> tuple[str, int]:
+        # 文本未变则 revision 保持,供 partial/final 共用同一 source_key
+        if text != self._last_text:
+            self._last_text = text
+            self.revision += 1
+        return self.source_key, self.revision
+
+
+def load_latency_config(path: str | None = None,
+                        cli_right_context: int | None = None) -> dict:
+    """读取延迟相关开关；nemotron_right_context 仅允许 3/6/13,非法回退 6。"""
+    raw: dict = {}
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    raw = loaded
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+    configured = raw.get("nemotron_right_context", 6)
+    try:
+        right_context = int(configured)
+    except (TypeError, ValueError):
+        right_context = 6
+    if right_context not in (3, 6, 13):
+        right_context = 6
+    if cli_right_context in (3, 6, 13):
+        # CLI 优先级高于配置文件
+        right_context = int(cli_right_context)
+    return {
+        "nemotron_right_context": right_context,
+        "translation_priority_enabled": bool(raw.get("translation_priority_enabled", True)),
+        "probe_partial_enabled": bool(raw.get("probe_partial_enabled", True)),
+        "nemotron_native_streaming_enabled": bool(
+            raw.get("nemotron_native_streaming_enabled", False)
+        ),
+    }
 
 # --------------- 段文件消费 ---------------
 
@@ -540,21 +628,30 @@ def drain_audio_queue(q: "queue_mod.Queue",
     SegDirWriter→/tmp 段文件→read_segments 磁盘往返(1s 段聚合 +
     0.15s 轮询,每段最多 +1.15s 延迟,且 /tmp 被系统清理会断链)。
 
+    队列元素可以是 AudioChunk 或裸 ndarray(兼容旧测试/离线投喂);
+    返回始终是 ndarray 列表。采集时间戳仅写入度量字段,不改变断句。
+
     SENTINEL(None) = 当前 source 流结束(audio swap 时旧 source 冲刷
     完毕)——丢弃并停止 drain,下一轮主循环读到的是(swap 后的)新
     source.queue。
     """
     chunks: list[np.ndarray] = []
+
+    def _unwrap(item):
+        # AudioChunk → samples；裸 ndarray 原样返回
+        samples = getattr(item, "samples", item)
+        return samples
+
     try:
         first = q.get(timeout=first_timeout)
         if first is None:
             return chunks
-        chunks.append(first)
+        chunks.append(_unwrap(first))
         while True:
             nxt = q.get_nowait()
             if nxt is None:
                 break
-            chunks.append(nxt)
+            chunks.append(_unwrap(nxt))
     except queue_mod.Empty:
         pass
     return chunks
@@ -579,6 +676,9 @@ class EventLogger:
 
     def write(self, event: dict):
         if self._f:
+            # 统一单调/墙钟时间戳字段,供 latency_report 关联
+            event.setdefault("event_mono_ns", time.monotonic_ns())
+            event.setdefault("event_wall_ms", int(time.time() * 1000))
             line = json.dumps(event, ensure_ascii=False) + "\n"
             with self._write_lock:
                 self._f.write(line)
@@ -626,7 +726,9 @@ class EventLogger:
                   submit_reason="", buffered_sec=0, speech_sec=0,
                   trailing_silence_sec=0, prompt_hash="", tail_source_chars=0,
                   asm_ms=0, postproc_ms=0,
-                  language="", avg_logprob=0, avg_compression=0, no_speech_prob=0):
+                  language="", avg_logprob=0, avg_compression=0, no_speech_prob=0,
+                  source_key="", revision=0, speech_start_mono_ns=0,
+                  speech_end_mono_ns=0, split_method=""):
         event = {
             "event_type": "final",
             "seg_start": seg_start,
@@ -653,13 +755,21 @@ class EventLogger:
             "avg_logprob": round(avg_logprob, 4),
             "avg_compression": round(avg_compression, 4),
             "no_speech_prob": round(no_speech_prob, 4),
+            "source_key": source_key,
+            "revision": revision,
+            "speech_start_mono_ns": speech_start_mono_ns,
+            "speech_end_mono_ns": speech_end_mono_ns or time.monotonic_ns(),
+            "split_method": split_method,
             "accepted": True,
         }
         self.write(event)
 
     def log_partial(self, seg_start: int, seg_end: int,
                     audio_start_sec: float, audio_end_sec: float,
-                    text: str):
+                    text: str, *, source_key: str = "", revision: int = 0,
+                    is_probe: bool = False,
+                    speech_start_mono_ns: int = 0,
+                    asr_completed_mono_ns: int = 0):
         self.write({
             "event_type": "partial",
             "seg_start": seg_start,
@@ -667,6 +777,11 @@ class EventLogger:
             "audio_start_sec": round(audio_start_sec, 3),
             "audio_end_sec": round(audio_end_sec, 3),
             "text": text,
+            "source_key": source_key,
+            "revision": revision,
+            "is_probe": is_probe,
+            "speech_start_mono_ns": speech_start_mono_ns,
+            "asr_completed_mono_ns": asr_completed_mono_ns or time.monotonic_ns(),
             "accepted": False,
         })
 
@@ -761,7 +876,21 @@ def main():
                         help="麦克风设备索引或名字(传给 sounddevice);默认系统默认")
     parser.add_argument("--dual-model", action="store_true",
                         help="预加载 Nemotron + Qwen3 双模型（中文秒切，耗内存）")
+    parser.add_argument("--lang-config", default="/tmp/whicc-out/lang_config.json",
+                        help="lang_config.json 路径(打包版显式传入运行目录配置)")
+    parser.add_argument("--nemotron-right-context", type=int, default=None,
+                        choices=[3, 6, 13],
+                        help="Nemotron look-ahead 档位;优先于 lang_config")
     args = parser.parse_args()
+
+    # 读取延迟相关开关与 look-ahead 档位
+    latency_cfg = load_latency_config(args.lang_config, args.nemotron_right_context)
+    args.nemotron_right_context = latency_cfg["nemotron_right_context"]
+    probe_partial_enabled = latency_cfg["probe_partial_enabled"]
+    native_streaming_enabled = latency_cfg["nemotron_native_streaming_enabled"]
+    print(f"[latency-config] right_context={args.nemotron_right_context} "
+          f"probe_partial={probe_partial_enabled} "
+          f"native_streaming={native_streaming_enabled}", flush=True)
 
     # 解析模型路径：优先级 model_state.json > --model 参数 > 内置默认
     # 与 review #1/#3 修过的 lang_config 模式一致——只动自己关心的字段。
@@ -1178,6 +1307,16 @@ def main():
 
     # 保存尾部 overlap
     tail_overlap = np.array([], dtype=np.float32)
+    # 稳定 source_key：同一句 partial/final 共用；文本变化时 revision++
+    source_sequence = 0
+    source_revision = SourceRevision(f"{args.run_id}:{source_sequence}")
+    speech_start_mono_ns = 0
+    last_probe_text = ""
+
+    def advance_source_revision() -> None:
+        nonlocal source_sequence, source_revision
+        source_sequence += 1
+        source_revision = SourceRevision(f"{args.run_id}:{source_sequence}")
 
     def save_tail(samples: np.ndarray) -> np.ndarray:
         """返回 samples 末尾 overlap_samples 长度的片段；overlap_samples<=0 时返回空数组"""
@@ -1204,6 +1343,7 @@ def main():
                      overlap_applied: bool = False,
                      precomputed_result: dict | None = None):
         nonlocal confirmed_text, tail_overlap, tail_buffer, resolved_model, resolved_backend, zh_streak, ja_streak, en_streak, pending_switch
+        nonlocal source_revision, speech_start_mono_ns, last_probe_text
 
         chunk_sec = len(samples) / SAMPLE_RATE
         audio_start_sec = seg_start * SEG_DURATION_SEC
@@ -1250,6 +1390,8 @@ def main():
 
             # 立刻写 partial 事件，翻译层可提前消费
             # 但过滤掉单字幻觉（"The." "See." 等），不让它进翻译
+            source_key, revision = source_revision.update(
+                (result.get("text") or "").strip())
             if result["text"] and logger._f:
                 _ptxt = result["text"].strip().rstrip(".!?")
                 _is_single_halluc = (
@@ -1257,9 +1399,14 @@ def main():
                     and _ptxt.lower() in {"the", "see", "you", "a", "oh", "so", "and", "but", "is"}
                 )
                 if not _is_single_halluc:
+                    # 提交时 partial：与探针共用稳定 source_key/revision
                     logger.log_partial(seg_start, seg_end,
                                        audio_start_sec, audio_end_sec,
-                                       result["text"])
+                                       result["text"],
+                                       source_key=source_key,
+                                       revision=revision,
+                                       is_probe=False,
+                                       speech_start_mono_ns=speech_start_mono_ns)
 
             if args.dump_raw and result["text"]:
                 print(f"[raw] {result['text']}", file=sys.stderr, flush=True)
@@ -1413,7 +1560,14 @@ def main():
                              language=result["language"],
                              avg_logprob=result["avg_logprob"],
                              avg_compression=result["avg_compression"],
-                             no_speech_prob=result["no_speech_prob"])
+                             no_speech_prob=result["no_speech_prob"],
+                             source_key=source_key,
+                             revision=revision,
+                             speech_start_mono_ns=speech_start_mono_ns)
+            # 一句已确认：下一句换新 source_key
+            advance_source_revision()
+            last_probe_text = ""
+            speech_start_mono_ns = 0
 
         except Exception as e:
             print(f"[error] submit_chunk 异常，跳过当前 chunk: {e}", file=sys.stderr, flush=True)
@@ -1516,6 +1670,9 @@ def main():
                 rms = np.sqrt(np.mean(window ** 2)) if len(window) > 0 else 0
 
                 if rms > args.silence_threshold:
+                    if not has_speech and speech_start_mono_ns == 0:
+                        # 记录本句开口单调时间：开口→草稿延迟口径
+                        speech_start_mono_ns = time.monotonic_ns()
                     has_speech = True
                     silence_streak = 0
                     speech_accumulated += len(samples) / SAMPLE_RATE
@@ -1556,6 +1713,29 @@ def main():
                             sm_text = None
                             sm_result = None
                             sm_audio = np.array([], dtype=np.float32)
+                        elif probe_partial_enabled and sm_text != last_probe_text:
+                            # 探针文本变化：立即下发 is_probe partial，供 UI/翻译草稿
+                            _ptxt = sm_text.strip().rstrip(".!?")
+                            _is_single_halluc = (
+                                len(_ptxt) <= 4
+                                and _ptxt.lower() in {
+                                    "the", "see", "you", "a", "oh", "so", "and", "but", "is"
+                                }
+                            )
+                            if not _is_single_halluc and logger._f:
+                                sk, rev = source_revision.update(sm_text)
+                                audio_start_sec = chunk_first_seg * SEG_DURATION_SEC
+                                audio_end_sec = (seg_end + 1) * SEG_DURATION_SEC
+                                logger.log_partial(
+                                    chunk_first_seg, seg_end,
+                                    audio_start_sec, audio_end_sec,
+                                    sm_text,
+                                    source_key=sk,
+                                    revision=rev,
+                                    is_probe=True,
+                                    speech_start_mono_ns=speech_start_mono_ns,
+                                )
+                                last_probe_text = sm_text
                     except Exception as e:
                         print(f"[probe-asr] ASR 异常: {e}", file=sys.stderr, flush=True)
                         sm_text = None
@@ -1581,7 +1761,7 @@ def main():
             if (chunk_sec >= _min_chunk_for_punct and has_speech and sm_text
                     and _stripped_sm[-1:] in STRONG_END_PUNCT
                     and _chars_before_punct >= _min_chars_before_punct):
-                split_sec = find_audio_split_sec(
+                split_sec, split_method = find_audio_split_sec(
                     sm_text, chunk_sec, sm_segments,
                     min_char_pos=0)  # 任意位置都允许,标点已经是强句末
                 # 校验: 切点不能太短 (< 0.5s, 字幕太碎) 也不能太靠近结尾
@@ -1591,7 +1771,8 @@ def main():
                     split_pos = int(split_sec * SAMPLE_RATE)
                     first_part = all_sm[:split_pos]
                     remainder_audio = all_sm[split_pos:]
-                    print(f"[punct-split] 标点位置切 @{split_sec:.1f}s/{chunk_sec:.1f}s: "
+                    print(f"[punct-split] 标点位置切 @{split_sec:.1f}s/{chunk_sec:.1f}s "
+                          f"method={split_method}: "
                           f"{sm_text[:50]}... | 剩余 {len(remainder_audio)/SAMPLE_RATE:.1f}s",
                           file=sys.stderr, flush=True)
                     submit_chunk(first_part, chunk_first_seg, seg_end,
@@ -1618,12 +1799,12 @@ def main():
             # 共用上面探针的 sm_text/sm_segments 缓存,不重复跑推理。
             # 找到合适的标点 → 在标点位置切 (前半提交 final, 后半作为新 chunk 继续)。
             if chunk_sec >= SOFT_MAX_SEC and has_speech and sm_text:
-                split_sec = find_audio_split_sec(
+                split_sec, split_method = find_audio_split_sec(
                     sm_text, chunk_sec, sm_segments,
                     min_char_pos=SOFT_MAX_MIN_CHARS)
                 split_label = "整句"
                 if split_sec == 0 and len(sm_text) >= SOFT_MAX_MIN_CHARS:
-                    split_sec = find_audio_split_sec(
+                    split_sec, split_method = find_audio_split_sec(
                         sm_text, chunk_sec, sm_segments,
                         punct_set=SENTENCE_END_PUNCT | MID_PUNCT,
                         min_char_pos=SOFT_MAX_MIN_CHARS)
@@ -1632,7 +1813,8 @@ def main():
                 max_remainder = 0.5 if split_label == "中间标点" else 0.3
                 if split_sec == 0 or split_sec <= min_split or split_sec > chunk_sec - max_remainder:
                     if split_sec > 0:
-                        print(f"[soft-max] 标点位置不佳 ({split_sec:.1f}s/{chunk_sec:.1f}s)，继续积累",
+                        print(f"[soft-max] 标点位置不佳 ({split_sec:.1f}s/{chunk_sec:.1f}s "
+                              f"method={split_method})，继续积累",
                               file=sys.stderr, flush=True)
                 else:
                     all_sm = np.concatenate(collected)
@@ -1641,7 +1823,8 @@ def main():
                     remainder_audio = all_sm[split_pos:]
                     is_full = split_label == "整句"
                     reason = "soft_max" if is_full else "soft_max_split"
-                    print(f"[soft-max] {split_label}断句 @{split_sec:.1f}s: "
+                    print(f"[soft-max] {split_label}断句 @{split_sec:.1f}s "
+                          f"method={split_method}: "
                           f"{sm_text[:50]} | 剩余 {len(remainder_audio)/SAMPLE_RATE:.1f}s",
                           file=sys.stderr, flush=True)
                     submit_chunk(first_part, chunk_first_seg, seg_end,
