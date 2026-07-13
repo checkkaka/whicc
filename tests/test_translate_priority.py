@@ -382,6 +382,28 @@ def test_length_finish_reason_not_reused():
     assert finals and finals[-1].get("final_reused_partial") is not True
 
 
+def test_length_finish_reason_clears_partial_cache():
+    """流式完成但 finish_reason=length 时必须清掉 partial_cache。"""
+    worker, translator, _f_trans = _make_worker()
+    translator.last_finish_reason = "length"
+    worker.start()
+    worker.dispatch_partial(
+        {"seg_start": 0, "seg_end": 1, "revision": 1, "audio_end_sec": 1,
+         "audio_start_sec": 0, "text": "hello"},
+        "hello", "k-len-cache",
+    )
+    deadline = time.time() + 2
+    while not translator.calls and time.time() < deadline:
+        time.sleep(0.02)
+    time.sleep(0.05)
+    worker.stop()
+    assert "k-len-cache" not in worker.partial_cache
+    snap = worker._partial_snapshots.get("k-len-cache")
+    assert snap is not None
+    assert snap.get("output_valid") is False
+    assert snap.get("finish_reason") == "length"
+
+
 def test_cancelled_partial_clears_partial_cache():
     """取消后 partial_cache 条目被清除，避免脏缓存。"""
     worker, translator, f_trans = _make_worker()

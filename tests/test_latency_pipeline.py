@@ -236,3 +236,50 @@ def test_do_transcribe_default_right_context_is_six():
     assert sig.parameters["nemotron_right_context"].default == 6
     sig2 = inspect.signature(whicc._do_transcribe_nemotron)
     assert sig2.parameters["right_context"].default == 6
+
+
+def test_latency_report_uses_ui_or_first_token_for_trans_draft(tmp_path):
+    """开口→翻译草稿优先 ui_first_translation_draft，否则 first_token。"""
+    import subprocess
+
+    events = tmp_path / "events.jsonl"
+    trans = tmp_path / "trans.jsonl"
+    ui = tmp_path / "ui.jsonl"
+    events.write_text(
+        json.dumps({
+            "event_type": "partial",
+            "source_key": "k1",
+            "is_probe": True,
+            "speech_start_mono_ns": 1_000_000_000,
+            "event_mono_ns": 1_200_000_000,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    # 无 event_mono_ns，只有 translation_first_token_mono_ns（真实写盘形态）
+    trans.write_text(
+        json.dumps({
+            "event_type": "translation_partial",
+            "source_key": "k1",
+            "translation_first_token_mono_ns": 1_500_000_000,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    ui.write_text(
+        json.dumps({
+            "metric": "ui_first_translation_draft",
+            "source_key": "k1",
+            "event_mono_ns": 1_600_000_000,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    report = Path(__file__).resolve().parents[1] / "tools" / "latency_report.py"
+    out = subprocess.check_output(
+        [sys.executable, str(report),
+         "--events", str(events),
+         "--translations", str(trans),
+         "--ui", str(ui)],
+        text=True,
+    )
+    # UI 草稿相对开口 = 600ms
+    assert "开口→首个翻译草稿" in out
+    assert "P50=600.0ms" in out

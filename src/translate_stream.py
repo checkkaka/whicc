@@ -721,6 +721,8 @@ class TranslateWorker:
             finish_reason=fr,
         )
         if bad or not output_valid:
+            # 业务目的：截断/脏译文不得留在 partial_cache，避免后续跳过重译或 fallback 半截
+            self.partial_cache.pop(key, None)
             return
 
         # 补一条带完成时间戳的 partial（不 commit）
