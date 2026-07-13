@@ -615,7 +615,8 @@ class TranslateWorker:
     def _save_partial_snapshot(self, key: str, *, source_text: str,
                                translated_text: str, completed: bool,
                                output_valid: bool, request_signature: str,
-                               translate_ms: float) -> None:
+                               translate_ms: float,
+                               finish_reason: str | None = None) -> None:
         """业务目的：保存 partial 完成快照，供 final 在签名一致时复用。"""
         self._partial_snapshots[key] = {
             "source_text": source_text,
@@ -624,6 +625,7 @@ class TranslateWorker:
             "output_valid": output_valid,
             "request_signature": request_signature,
             "translate_ms": translate_ms,
+            "finish_reason": finish_reason or "stop",
         }
 
     def _do_partial(self, event, source_text, key, enqueued_ns=None,
@@ -712,6 +714,7 @@ class TranslateWorker:
             output_valid=output_valid,
             request_signature=sig,
             translate_ms=float(ms),
+            finish_reason=getattr(self.translator, "last_finish_reason", None),
         )
         if bad:
             return
@@ -797,6 +800,7 @@ class TranslateWorker:
                 "translation_request_started_mono_ns": started_ns,
                 "translation_first_token_mono_ns": started_ns,
                 "translation_completed_mono_ns": completed_ns,
+                "finish_reason": reused.get("finish_reason") or "stop",
             }
 
         # 全量重译
@@ -871,6 +875,7 @@ class TranslateWorker:
             "translation_request_started_mono_ns": started_ns,
             "translation_first_token_mono_ns": first_token_ns or completed_ns,
             "translation_completed_mono_ns": completed_ns,
+            "finish_reason": getattr(self.translator, "last_finish_reason", None) or "stop",
         }
 
     def _write_failed_partial(self, key: str, source_text: str) -> None:

@@ -643,6 +643,8 @@ class VLLMBackend:
             )
         self._connect_timeout = connect_timeout
         self._client = None  # 懒建的 httpx.Client(_http_client)
+        # 最近一次生成的 finish_reason（stop/length）；供上层检测截断
+        self.last_finish_reason: str | None = None
         # per-URL API key — 非空时所有请求(探活 + 生成)带
         # `Authorization: Bearer` 头。key 跟 candidates 同格式化。
         self._api_key_per_url: dict[str, str] = {
@@ -935,8 +937,18 @@ class VLLMBackend:
                 if "error" in result and result["error"]:
                     raise RuntimeError(f"翻译服务错误: {result['error']}")
                 if self._active_endpoint == "responses":
-                    return self._parse_responses_output(result).strip()
-                return result["choices"][0]["message"]["content"].strip()
+                    text = self._parse_responses_output(result).strip()
+                    # Responses 完成态：尽量记录 finish_reason（若有 status）
+                    self.last_finish_reason = (
+                        result.get("status")
+                        or result.get("incomplete_details", {}).get("reason")
+                        or "stop"
+                    )
+                    return text
+                choice = result["choices"][0]
+                # 业务目的：记录 finish_reason，检测 length 截断
+                self.last_finish_reason = choice.get("finish_reason") or "stop"
+                return choice["message"]["content"].strip()
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
                 if attempt < 2 and self._flip_endpoint_if_auto(code):
@@ -1004,6 +1016,7 @@ class VLLMBackend:
         """消费 SSE 流,逐 token 回调。chat 与 responses 两种事件格式。"""
         full = ""
         is_responses = self._active_endpoint == "responses"
+        self.last_finish_reason = None
         for raw_line in resp.iter_lines():
             # 业务目的：final 入队后立刻停掉同 key 的 partial SSE，释放带宽
             if cancel_check and cancel_check():
@@ -1038,17 +1051,25 @@ class VLLMBackend:
                             full += piece
                             on_token(piece, full)
                     elif ctype == "response.completed":
+                        self.last_finish_reason = "stop"
                         break
                     elif ctype in ("response.error", "error", "response.failed"):
                         raise RuntimeError(f"Responses API 错误: {chunk}")
                     continue
-                delta = chunk["choices"][0].get("delta", {})
+                choice0 = chunk["choices"][0]
+                delta = choice0.get("delta", {})
                 piece = delta.get("content", "")
                 if piece:
                     full += piece
                     on_token(piece, full)  # (piece, cumulative)
+                # 业务目的：流式结束帧携带 finish_reason（stop/length）
+                fr = choice0.get("finish_reason")
+                if fr:
+                    self.last_finish_reason = fr
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
+        if not self.last_finish_reason:
+            self.last_finish_reason = "stop"
         return full.strip()
 
 
@@ -1081,6 +1102,11 @@ class HyMT2Translator:
                                     model_map=model_map,
                                     api_key_map=api_key_map,
                                     endpoint=endpoint)
+
+    @property
+    def last_finish_reason(self) -> str | None:
+        """最近一次 HTTP 生成的 finish_reason（stop/length 等）。"""
+        return getattr(self._backend, "last_finish_reason", None)
 
     def _generate(self, messages: list[dict]) -> tuple[str, float]:
         """底层推理，返回 (raw_output, elapsed_ms)。"""

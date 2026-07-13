@@ -160,3 +160,34 @@ def test_nemotron_stream_reset_changes_chunk_size():
     assert stream.chunk_frames == 14
     stream.reset(right_context=3)
     assert stream.chunk_frames == 4
+
+
+def test_nemotron_stream_same_audio_different_block_sizes():
+    """同一音频按 100ms / 128ms / 随机块 feed，累计文本一致。"""
+    import numpy as np
+    from nemotron_stream import NemotronStream
+
+    pcm = np.random.randn(16000 * 2).astype(np.float32) * 0.01
+
+    def fake_generate(audio, language="auto", right_context=6):
+        # 文本只依赖总长度，模拟“同音频同结果”
+        return {"text": f"samples={len(audio)}"}
+
+    def run(block: int) -> str:
+        s = NemotronStream(generate_fn=fake_generate, right_context=6)
+        for i in range(0, len(pcm), block):
+            s.feed(pcm[i:i + block])
+        return s.finalize().text
+
+    t100 = run(1600)
+    t128 = run(2048)
+    # 随机块
+    s = NemotronStream(generate_fn=fake_generate, right_context=6)
+    i = 0
+    rng = np.random.default_rng(0)
+    while i < len(pcm):
+        block = int(rng.integers(800, 2400))
+        s.feed(pcm[i:i + block])
+        i += block
+    t_rand = s.finalize().text
+    assert t100 == t128 == t_rand
