@@ -59,6 +59,7 @@ def read_user_scene(out_dir: str) -> str:
 
     与 event_agent.clear_event / macui LangConfig.sceneText 约定一致。
     文件缺失、键缺失或非字符串时返回空串。
+    捕 ValueError 覆盖 JSONDecodeError 与编码损坏的 UnicodeDecodeError。
     """
     path = os.path.join(out_dir, "lang_config.json")
     try:
@@ -66,7 +67,7 @@ def read_user_scene(out_dir: str) -> str:
             cfg = json.load(f)
         scene = cfg.get("scene", "")
         return scene.strip() if isinstance(scene, str) else ""
-    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+    except (OSError, ValueError, TypeError):
         return ""
 
 

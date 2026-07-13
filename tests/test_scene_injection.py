@@ -88,8 +88,22 @@ def test_strip_scene_echo_removes_prefix_and_scene():
     try:
         cleaned, hit = hy._strip_scene_echo("翻译场景：AI访谈\n这是译文")
         assert hit is True
-        assert "AI访谈" not in cleaned or cleaned.strip() == "这是译文"
-        assert "这是译文" in cleaned
+        assert cleaned == "这是译文"
+    finally:
+        hy.set_scene_context("")
+
+
+def test_strip_scene_echo_english_prefix():
+    """英文 prompt 分支的回显（Translation scene: …）也必须剥掉。"""
+    hy.set_scene_context("tech keynote")
+    try:
+        cleaned, hit = hy._strip_scene_echo("Translation scene: tech keynote\nThe translated text")
+        assert hit is True
+        assert cleaned == "The translated text"
+        # 大小写不敏感
+        cleaned2, hit2 = hy._strip_scene_echo("translation scene: tech keynote\nBody")
+        assert hit2 is True
+        assert cleaned2 == "Body"
     finally:
         hy.set_scene_context("")
 

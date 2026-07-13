@@ -546,10 +546,10 @@ def _strip_scene_echo(text: str) -> tuple[str, bool]:
     if out.startswith(scene):
         out = out[len(scene):].strip()
         return out, True
-    # "翻译场景：" 前缀
-    for prefix in ("翻译场景：", "翻译场景:"):
-        if out.startswith(prefix):
-            rest = out[len(prefix):]
+    # "翻译场景：" / "Translation scene:" 前缀（英文分支大小写不敏感）
+    for prefix in ("翻译场景：", "翻译场景:", "Translation scene:", "Translation scene："):
+        if out.lower().startswith(prefix.lower()):
+            rest = out[len(prefix):].strip()
             if rest.startswith(scene):
                 rest = rest[len(scene):].strip()
             out = rest
