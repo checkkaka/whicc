@@ -103,8 +103,20 @@ struct StatusChips: View {
     }
 
     private var asrHelpText: String {
-        let target = state.audioSource == .system ? "麦克风" : "系统声音"
-        return "ASR: \(asrLabel) · 当前采集：\(state.audioSource.displayName)\n点击切到\(target)"
+        let current: String
+        switch state.audioSource {
+        case .system: current = "系统声音"
+        case .mic: current = "麦克风"
+        case .application:
+            let name = langConfig.audioAppDisplayName
+            current = name.isEmpty ? "指定应用" : name
+        }
+        let target: String
+        switch state.audioSource {
+        case .system: target = "麦克风"
+        case .mic, .application: target = "系统声音"
+        }
+        return "ASR: \(asrLabel) · 当前采集：\(current)\n点击切到\(target)"
     }
 
     // MARK: Generic chip

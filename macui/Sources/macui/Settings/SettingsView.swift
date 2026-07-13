@@ -12,6 +12,7 @@ struct SettingsView: View {
 
     enum Pane: String, CaseIterable, Identifiable {
         case appearance = "外观"
+        case audio = "音频来源"
         case model  = "语音识别模型"
         case server = "翻译模型"
         case hermes = "Hermes"
@@ -20,12 +21,13 @@ struct SettingsView: View {
         /// Sidebar 显示标题 — LocalizedStringKey 自动查表 + 走 i18n fallback:
         /// - zh 系统 → 查 zh-Hans.lproj (没) → fallback 到代码字面量 (中文)
         /// - en 系统 → 查 en.lproj (有, 见下面 en.lproj/Localizable.strings
-        ///   "外观" = "Appearance" 等 4 条 key) → 显示英文
+        ///   "外观" = "Appearance" 等 key) → 显示英文
         /// rawValue 仍是 Pane 稳定 id (NavigationLink value + @State selection),
         /// 不要改。
         var localizedTitle: LocalizedStringKey {
             switch self {
             case .appearance: return "外观"
+            case .audio:      return "音频来源"
             case .server:     return "翻译模型"
             case .model:      return "语音识别模型"
             case .hermes:     return "Hermes"
@@ -35,6 +37,7 @@ struct SettingsView: View {
         var icon: String {
             switch self {
             case .appearance: return "paintbrush"
+            case .audio:  return "waveform"
             case .server: return "network"
             case .model:  return "cpu"
             case .hermes: return "sparkles"
@@ -78,6 +81,7 @@ struct SettingsView: View {
         } detail: {
             switch selection ?? .server {
             case .appearance: AppearancePane(state: overlayState, langConfig: langConfig)
+            case .audio: AudioSourcePane(langConfig: langConfig, overlayState: overlayState)
             case .server: ServerPane(langConfig: langConfig)
             case .model:  ModelPane(modelState: modelState, downloadState: downloadState, langConfig: langConfig)
             case .hermes: HermesPane(state: state, langConfig: langConfig, eventAgent: eventAgent)
