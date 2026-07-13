@@ -17,7 +17,23 @@
 "Speech Recognition Model" = "Speech Recognition Model";
 "Translation Model" = "Translation Model";
 "Hermes" = "Hermes";
+"外观" = "Appearance";
+"音频来源" = "Audio Source";
+"语音识别模型" = "Speech Recognition Model";
+"翻译模型" = "Translation Model";
 "折叠侧边栏（⌃⌘S）" = "Collapse sidebar (⌃⌘S)";
+
+/* AudioSourcePane.swift */
+"指定应用模式只捕获该应用的声音；目标退出后会等待重新启动，不会自动改回全部系统音频。需要「系统音频录制」权限。" = "App mode captures only that app's audio. If the app quits, whicc waits for it to relaunch and will not fall back to all system audio. Requires System Audio Recording permission.";
+"采集模式" = "Capture mode";
+"全部系统音频" = "All system audio";
+"捕获本机正在播放的所有声音" = "Capture everything currently playing on this Mac";
+"使用内置或默认输入设备" = "Use the built-in or default input device";
+"指定应用" = "Specific app";
+"只捕获所选应用产生的音频" = "Capture only audio produced by the selected app";
+"目标应用" = "Target app";
+"刷新应用列表" = "Refresh app list";
+"当前没有可选择的运行中应用" = "No eligible running apps";
 
 /* main.swift — window title + NSMenu items */
 "settings_window_title" = "Settings";
@@ -249,6 +265,9 @@
 /* AudioSource.displayName (HUD asrChip) */
 "系统" = "System";
 "麦克" = "Mic";
+"应用" = "App";
+"麦克风" = "Microphone";
+"状态" = "Status";
 
 /* StartupStage.displayText (banner 启动阶段) */
 "正在初始化 whicc…" = "Initializing whicc…";

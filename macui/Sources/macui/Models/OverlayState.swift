@@ -40,22 +40,24 @@ enum BilingualLayout: String, CaseIterable, Identifiable {
 // MARK: - Audio source
 
 /// HUD ASR chip 显示的音频采集源。
-///  - `.system`: 系统声音（audiotee + ScreenCaptureKit）
+///  - `.system`: 全部系统声音（audiotee）
 ///  - `.mic`: 内置麦克风（sounddevice + PortAudio）
-/// 持久化在 lang_config.json 的 audio_source 键；macui chip 点击切这个
-/// 字段 + 发 SIGHUP 给 whicc.py 触发热切换。
+///  - `.application`: 指定应用（audiotee --include-processes）
+/// 持久化在 lang_config.json 的 audio_source 键；macui chip 点击只在
+/// system ↔ mic 之间切换，指定应用仅从设置页进入。
 enum AudioSource: String, CaseIterable, Identifiable, Sendable {
     case system
     case mic
+    case application
 
     var id: String { rawValue }
 
     /// SF Symbol 名给 StatusChips asrChip 的 icon。
-    /// 跟 feat/mic-source-toggle 分支的 AudioSourceController 同款命名。
     var icon: String {
         switch self {
         case .system: return "speaker.wave.2.fill"
         case .mic:    return "mic.fill"
+        case .application: return "app.badge"
         }
     }
 
@@ -64,6 +66,7 @@ enum AudioSource: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .system: return "系统"
         case .mic:    return "麦克"
+        case .application: return "应用"
         }
     }
 }

@@ -16,7 +16,9 @@ items below are governed by their own terms.
 - **How it's used**: Compiled from source by `bin/build_audiotee.sh` into
   `bin/audiotee`, used by whicc to capture macOS system audio via Core Audio
   Taps. Source is cloned to `.vendor/audiotee/` at build time (gitignored,
-  not shipped with the repo).
+  not shipped with the repo). whicc applies local overlays from
+  `patches/audiotee/overlay/` (soft PID skip + stdin tap reconfigure) before
+  `swift build`.
 
 ### MIT License (AudioTee)
 
