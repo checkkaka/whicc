@@ -292,10 +292,15 @@ def build_messages(source_text: str, glossary_hits: dict[str, str] | None = None
     lang_name = _lang_name(target_lang, prompt_lang)
     glossary_block = build_glossary_block(glossary_hits or {}, prompt_lang)
     ctx = normalize_context_pairs(context)
-    scene = _scene_context
+    scene = (_scene_context or "").strip()
     parts = []
 
     if prompt_lang == "zh":
+        if scene:
+            # 调用场景注入：帮助模型理解领域上下文；_strip_scene_echo 会剥回显
+            parts.append(f"翻译场景：{scene}")
+            parts.append("请结合上述场景理解专业术语与专有名词，不要在译文中复述场景描述。")
+            parts.append("")
         if glossary_block:
             parts.append(glossary_block)
             parts.append("")
@@ -314,6 +319,10 @@ def build_messages(source_text: str, glossary_hits: dict[str, str] | None = None
         parts.append("")
         parts.append(source_text)
     else:
+        if scene:
+            parts.append(f"Translation scene: {scene}")
+            parts.append("Use the scene for terminology and context only. Do not repeat the scene description in the output.")
+            parts.append("")
         if glossary_block:
             parts.append(glossary_block)
             parts.append("")
@@ -347,10 +356,14 @@ def build_delta_messages(delta_text: str,
     prompt_lang = resolve_prompt_language(delta_text, target_lang)
     lang_name = _lang_name(target_lang, prompt_lang)
     glossary_block = build_glossary_block(glossary_hits or {}, prompt_lang)
-    scene = _scene_context
+    scene = (_scene_context or "").strip()
     parts = []
 
     if prompt_lang == "zh":
+        if scene:
+            parts.append(f"翻译场景：{scene}")
+            parts.append("请结合上述场景理解专业术语与专有名词，不要在译文中复述场景描述。")
+            parts.append("")
         if glossary_block:
             parts.append(glossary_block)
             parts.append("")
@@ -368,6 +381,10 @@ def build_delta_messages(delta_text: str,
         parts.append("")
         parts.append(delta_text)
     else:
+        if scene:
+            parts.append(f"Translation scene: {scene}")
+            parts.append("Use the scene for terminology and context only. Do not repeat the scene description in the output.")
+            parts.append("")
         if glossary_block:
             parts.append(glossary_block)
             parts.append("")
@@ -529,10 +546,10 @@ def _strip_scene_echo(text: str) -> tuple[str, bool]:
     if out.startswith(scene):
         out = out[len(scene):].strip()
         return out, True
-    # "翻译场景：" 前缀
-    for prefix in ("翻译场景：", "翻译场景:"):
-        if out.startswith(prefix):
-            rest = out[len(prefix):]
+    # "翻译场景：" / "Translation scene:" 前缀（英文分支大小写不敏感）
+    for prefix in ("翻译场景：", "翻译场景:", "Translation scene:", "Translation scene："):
+        if out.lower().startswith(prefix.lower()):
+            rest = out[len(prefix):].strip()
             if rest.startswith(scene):
                 rest = rest[len(scene):].strip()
             out = rest

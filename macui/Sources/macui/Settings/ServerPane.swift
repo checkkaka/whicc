@@ -249,6 +249,36 @@ struct ServerPane: View {
                 }
             }
 
+            // 手填翻译场景：写入 lang_config.json 的 scene 键，
+            // translate_stream 热重载后注入 Hy-MT2 prompt；不依赖 Hermes。
+            SettingsCard {
+                SettingsSectionHeader(
+                    icon: "text.bubble",
+                    title: "翻译场景",
+                    trailing: { EmptyView() }
+                )
+                TextField("如 AI访谈 / NBA总决赛", text: Binding(
+                    get: { langConfig.sceneText },
+                    set: { langConfig.setScene($0) }
+                ))
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(Color.primary.opacity(0.10), lineWidth: 0.5)
+                )
+                Text("注入翻译 prompt，帮助模型理解上下文；留空不注入。改完后数秒内生效，无需重启。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             // 语言(源 + 目标) — 从 AppearancePane 搬过来。源语言控制
             // ASR 识别目标,目标语言控制翻译输出,两者都跟翻译服务强相关,
             // 放在这一页让用户改完翻译服务 URL/模型后,顺手配语言。
