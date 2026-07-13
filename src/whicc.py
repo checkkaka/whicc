@@ -566,6 +566,9 @@ class EventLogger:
 
     def __init__(self, path: str):
         self.path = path
+        # audio.py 的采集线程(status_callback)与主循环共用同一 logger,
+        # 加锁防止 JSONL 行交错损坏(Swift EventWatcher 按行解析)。
+        self._write_lock = threading.Lock()
         if path:
             dirname = os.path.dirname(path)
             if dirname:
@@ -576,8 +579,10 @@ class EventLogger:
 
     def write(self, event: dict):
         if self._f:
-            self._f.write(json.dumps(event, ensure_ascii=False) + "\n")
-            self._f.flush()
+            line = json.dumps(event, ensure_ascii=False) + "\n"
+            with self._write_lock:
+                self._f.write(line)
+                self._f.flush()
 
     def log_status(self, status: str, **extra):
         event = {"event_type": "status", "status": status}
@@ -740,11 +745,18 @@ def main():
     parser.add_argument("--output-text", metavar="FILE", help="final-only 输出文件路径")
     parser.add_argument("--audio-bin", default=AUDIO_BIN, help="音频捕获二进制路径（audiotee）")
     parser.add_argument("--audio-source", default="system",
-                        choices=["system", "mic", "segdir"],
-                        help="音频源:system=截取系统声音(默认,audiotee),"
+                        choices=["system", "mic", "application", "segdir"],
+                        help="音频源:system=全部系统声音(默认,audiotee),"
                              "mic=麦克风(sounddevice),"
+                             "application=指定应用(audiotee --include-processes),"
                              "segdir=轮询 SEG_DIR 段文件(离线评估,"
                              "由 tools/whicc_file_audio.py 等外部进程投喂)")
+    parser.add_argument("--audio-app-bundle-id", default="",
+                        help="application 模式的目标 Bundle ID"
+                             " (也可由 lang_config.json 的 audio_app_bundle_id 提供)")
+    parser.add_argument("--audio-app-display-name", default="",
+                        help="application 模式展示名"
+                             " (也可由 lang_config.json 的 audio_app_display_name 提供)")
     parser.add_argument("--mic-device", default=None,
                         help="麦克风设备索引或名字(传给 sounddevice);默认系统默认")
     parser.add_argument("--dual-model", action="store_true",
@@ -825,23 +837,59 @@ def main():
     print(f"  后端: {resolved_backend}", flush=True)
 
     # 音频源:
-    #  - system/mic: 进程内采集线程,主循环直接消费内存 queue(无磁盘往返)
+    #  - system/mic/application: 进程内采集线程,主循环直接消费内存 queue
     #  - segdir:     外部进程写 SEG_DIR 段文件(tools/whicc_file_audio.py
     #                离线评估),主循环轮询 read_segments() — 文件协议只保留
     #                在这条评估入口
     from audio import make_source
+
+    def _read_audio_app_config() -> tuple[str, str, str]:
+        """从 lang_config.json 读 audio_source / Bundle ID / 展示名。
+
+        返回 (mode, bundle_id, display_name)。文件缺失时回退 CLI 参数。
+        """
+        mode = args.audio_source
+        bundle_id = args.audio_app_bundle_id or ""
+        display_name = args.audio_app_display_name or ""
+        try:
+            with open("/tmp/whicc-out/lang_config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            mode = cfg.get("audio_source", mode) or mode
+            bundle_id = cfg.get("audio_app_bundle_id", bundle_id) or bundle_id
+            display_name = (
+                cfg.get("audio_app_display_name", display_name) or display_name
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return mode, bundle_id, display_name
+
+    startup_mode, startup_bundle, startup_name = _read_audio_app_config()
+    # BackendLauncher 固定传 --audio-source system(argparse 默认值同为
+    # system),只在这种情况下用 lang_config 恢复用户上次选择;显式传
+    # --audio-source mic / segdir 的开发调试用法保持原语义不被覆盖。
+    if args.audio_source == "system" and startup_mode in (
+        "system", "mic", "application"
+    ):
+        args.audio_source = startup_mode
     use_segdir = args.audio_source == "segdir"
     audio_source = None
+
+    # 初始化日志器（在模型加载前，这样 status 事件能被 overlay 接收）
+    logger = EventLogger(args.events_jsonl)
+    logger.log_status("loading_model")
+
+    def _status_cb(status: str, **extra) -> None:
+        logger.log_status(status, **extra)
+
     if not use_segdir:
         audio_source = make_source(
             mode=args.audio_source,
             audiotee_path=args.audio_bin,
             mic_device=args.mic_device,
+            bundle_id=startup_bundle or None,
+            display_name=startup_name or None,
+            status_callback=_status_cb,
         )
-
-    # 初始化日志器（在模型加载前，这样 status 事件能被 overlay 接收）
-    logger = EventLogger(args.events_jsonl)
-    logger.log_status("loading_model")
 
     if no_complete_local_model:
         # 主槽/中文槽/默认全都没下载完 — 音频采集还没 start,直接退。
@@ -1000,61 +1048,94 @@ def main():
     import threading as _threading
     _audio_swap_lock = _threading.Lock()
 
-    def _swap_audio_source(new_mode: str) -> None:
+    def _swap_audio_source(
+        new_mode: str,
+        bundle_id: str = "",
+        display_name: str = "",
+    ) -> None:
         """停掉旧 audio source,启动新 source,替换 audio_source 引用。
         失败时 log error 但不崩溃 (whicc.py 继续跑 — 用户改错了能重试)。
         """
         nonlocal audio_source
-        with _audio_swap_lock:
+        # 非阻塞取锁:SIGHUP handler 在主线程同步执行,若上一个 swap 还在
+        # 进行中(锁被同线程外层持有),阻塞 acquire 会自我死锁。取不到锁
+        # 直接放弃本次 swap——Swift 侧连点时后到的信号丢弃是安全的,
+        # 用户最后一次点击落盘的配置会在下一个 SIGHUP 生效。
+        if not _audio_swap_lock.acquire(blocking=False):
+            logger.log_status("audio swap busy, ignored")
+            return
+        try:
             if audio_source is None:
                 return  # segdir 模式没有进程内 source,不支持热切换
-            if new_mode not in ("system", "mic"):
+            if new_mode not in ("system", "mic", "application"):
                 logger.log_status(f"unknown audio mode: {new_mode}")
+                return
+            if new_mode == "application" and not bundle_id:
+                logger.log_status("application mode missing bundle_id")
+                return
+            # 同 mode + 同 bundle 无需重启;但 source 已进入 failed 态
+            # (supervisor 三连败停机)时放行,让用户重选同一应用能复活捕获。
+            source_failed = bool(getattr(audio_source, "failed", False))
+            same_app = (
+                new_mode == "application"
+                and getattr(audio_source, "bundle_id", None) == bundle_id
+                and audio_source.label == "application"
+            )
+            if (not source_failed) and audio_source.label == new_mode and (
+                new_mode != "application" or same_app
+            ):
                 return
             try:
                 old_source = audio_source
                 # 旧 source 停 = 它把 SENTINEL 放进自己的 queue,主循环
                 # drain 到 SENTINEL 就知道这段流结束,换读新 source 的 queue。
                 old_source.stop()
-                # macOS Core Audio process tap: 旧 audiotee 退出后,新
-                # audiotee 启动时 macOS 26 不会重新授权 process tap
-                # (TCC 静默返回 0 字节 → ~8s 后被 audio.py stall 检测
-                # 杀掉)。等 1s 让 Core Audio 回收 tap 注册再起新 source。
-                # SystemAudioSource (audiotee) 不需要 sleep;MicSource
-                # 走 sounddevice 不涉及 TCC,无需等待。
-                if old_source.label == "system":
-                    time.sleep(1.0)
+                # 注:audiotee 的 kill→respawn 之间的 TCC 冷却等待已下沉到
+                # audio.py _spawn_shared_unlocked(kill 与 spawn 之间),这里
+                # 不再 sleep —— stop() 本身不杀 audiotee,在这睡等不到任何事。
                 # 创建新 source。mic-device 跟首次启动同 (无变更)。
                 new_source = make_source(
                     mode=new_mode,
                     audiotee_path=args.audio_bin,
                     mic_device=args.mic_device,
+                    bundle_id=bundle_id or None,
+                    display_name=display_name or None,
+                    status_callback=_status_cb,
                 )
                 new_source.start()
                 # 替换 audio_source 引用 — 主循环每轮重新读该变量,
                 # drain 完旧 queue(SENTINEL 收尾)后自然接上新 queue。
                 audio_source = new_source
-                logger.log_status(f"audio source → {new_mode}")
+                if new_mode == "application":
+                    logger.log_status(
+                        f"audio source → application:{display_name or bundle_id}",
+                        bundle_id=bundle_id,
+                    )
+                else:
+                    logger.log_status(f"audio source → {new_mode}")
             except Exception as e:
                 # 启动失败,继续用旧 source 跑 (降级)
                 logger.log_status(f"audio swap to {new_mode} failed: {e}")
                 # new_source.start() 失败时 audio_source 引用未替换,
                 # 主循环继续读旧 source 的 queue(降级,用户可重试)
+        finally:
+            _audio_swap_lock.release()
 
     def _sighup_audio_swap(_signum, _frame) -> None:
         """SIGHUP handler — 读 lang_config.json + swap audio source。
         同步执行 (Python signal handler 限制);swap 内部加锁防重入。
+        同为 application 模式但 Bundle ID 变化时也会触发 swap。
         """
         if audio_source is None:
             return  # segdir 模式(离线评估)没有进程内 source,不支持热切换
         try:
-            with open("/tmp/whicc-out/lang_config.json", "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            new_mode = cfg.get("audio_source", args.audio_source)
-            if new_mode != audio_source.label:
-                # label 跟 raw mode 同名 (system/mic) 见 audio.py make_source
-                # — 直接传 rawValue
-                _swap_audio_source(new_mode)
+            new_mode, bundle_id, display_name = _read_audio_app_config()
+            cur_bundle = getattr(audio_source, "bundle_id", None) or ""
+            need_swap = new_mode != audio_source.label or (
+                new_mode == "application" and bundle_id != cur_bundle
+            )
+            if need_swap:
+                _swap_audio_source(new_mode, bundle_id, display_name)
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
             logger.log_status(f"audio swap: bad config: {e}")
 
@@ -1368,7 +1449,16 @@ def main():
             # (实测),比等 30s 少断流 18s。
             now = time.monotonic()
             # 收到首段数据后才开始计时;启动期静音不退出。
-            if last_data_time is not None and now - last_data_time > 12.0:
+            # application 模式等待目标应用启动/出声是正常态(可能持续数
+            # 分钟),此期间豁免看门狗 —— 否则 12s 无数据就 exit(4) 重启
+            # 整个后端,违反「保持等待,不回退」的语义。
+            waiting_for_app = bool(
+                audio_source is not None
+                and getattr(audio_source, "waiting_for_app", False)
+            )
+            if waiting_for_app:
+                last_data_time = None  # 等待结束后重新计时
+            elif last_data_time is not None and now - last_data_time > 12.0:
                 print(f"\n[error] 音频源 12s 无数据(audiotee 重启也没救回),"
                       "退出换新进程重新授权 process tap。",
                       file=sys.stderr, flush=True)
