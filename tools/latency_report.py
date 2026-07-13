@@ -114,8 +114,18 @@ def main() -> int:
 
         if probe and probe.get("speech_start_mono_ns") and probe.get("event_mono_ns"):
             speech_to_draft.append(probe["event_mono_ns"] - probe["speech_start_mono_ns"])
-        if tpartial and probe and probe.get("speech_start_mono_ns") and tpartial.get("event_mono_ns"):
-            speech_to_trans_draft.append(tpartial["event_mono_ns"] - probe["speech_start_mono_ns"])
+        # 开口→翻译草稿：优先 UI 首译草稿；否则 translation_first_token / event_mono_ns
+        ui_tdraft = bag.get("ui_first_translation_draft")
+        draft_ns = None
+        if ui_tdraft and ui_tdraft.get("event_mono_ns"):
+            draft_ns = ui_tdraft["event_mono_ns"]
+        elif tpartial:
+            draft_ns = (
+                tpartial.get("translation_first_token_mono_ns")
+                or tpartial.get("event_mono_ns")
+            )
+        if draft_ns and probe and probe.get("speech_start_mono_ns"):
+            speech_to_trans_draft.append(draft_ns - probe["speech_start_mono_ns"])
         if ui_final and final and final.get("speech_end_mono_ns") and ui_final.get("event_mono_ns"):
             end_to_ui_final.append(ui_final["event_mono_ns"] - final["speech_end_mono_ns"])
         if tfinal:

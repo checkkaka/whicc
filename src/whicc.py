@@ -1492,7 +1492,7 @@ def main():
                                        model=resolved_model,
                                        backend=resolved_backend,
                                        nemotron_right_context=(
-                                           13 if resolved_backend != "nemotron"
+                                           6 if resolved_backend != "nemotron"
                                            else args.nemotron_right_context
                                        ))
             t_infer_end = time.monotonic()
@@ -1882,7 +1882,7 @@ def main():
                                                   model=resolved_model,
                                                   backend=resolved_backend,
                                                   nemotron_right_context=(
-                                                      13 if resolved_backend != "nemotron"
+                                                      6 if resolved_backend != "nemotron"
                                                       else args.nemotron_right_context
                                                   ))
                         sm_text = result_sm.get("text", "").strip()
