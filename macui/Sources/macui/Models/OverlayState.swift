@@ -195,6 +195,9 @@ final class OverlayState: ObservableObject {
 
     // Lost drafts log
     private static var lostDraftsPath: String { AppPaths.runDir + "/lost_drafts.jsonl" }
+    private static var uiMetricsPath: String { AppPaths.runDir + "/ui_metrics.jsonl" }
+    /// 已写过的 (metric, sourceKey)，避免同一句重复刷首字草稿指标
+    private static var uiMetricsSeen = Set<String>()
     private var pendingDraftSrc: String?
     private var pendingDraftTrans: String?
     private var pendingDraftTs: Double = 0
@@ -490,6 +493,15 @@ final class OverlayState: ObservableObject {
         if !src.isEmpty { draftSourceText = Self.deduplicateRepeated(src) }
         draftTranslatedText = trans.map { Self.deduplicateRepeated($0) }
         draftStablePrefixLen = event.sharedPrefixLen ?? 0
+        // 度量：首次原文/翻译草稿上屏
+        if let key = event.sourceKey {
+            if !src.isEmpty {
+                Self.writeUIMetric(metric: "ui_first_source_draft", sourceKey: key)
+            }
+            if let t = trans, !t.isEmpty {
+                Self.writeUIMetric(metric: "ui_first_translation_draft", sourceKey: key)
+            }
+        }
 
         if let t = trans, !t.isEmpty {
             pendingDraftSrc = src
@@ -524,6 +536,8 @@ final class OverlayState: ObservableObject {
         pendingDraftSrc = nil
         pendingDraftTrans = nil
         totalTranslated += 1
+        // 度量：稳定字幕已在 UI 应用完成
+        Self.writeUIMetric(metric: "ui_final_applied", sourceKey: key)
         // Real subtitle arrived — dismiss the startup banner.
         dismissStartupBanner(animated: true)
     }
@@ -760,6 +774,31 @@ final class OverlayState: ObservableObject {
             fh.closeFile()
         } else {
             try? lineWithNewline.write(toFile: Self.lostDraftsPath, atomically: false, encoding: .utf8)
+        }
+    }
+
+    /// 写入独立 ui_metrics.jsonl，避免与 Python 多进程争用同一事件文件。
+    private static func writeUIMetric(metric: String, sourceKey: String) {
+        let dedupe = "\(metric)|\(sourceKey)"
+        if metric != "ui_final_applied" {
+            if uiMetricsSeen.contains(dedupe) { return }
+            uiMetricsSeen.insert(dedupe)
+        }
+        let entry: [String: Any] = [
+            "metric": metric,
+            "source_key": sourceKey,
+            "event_mono_ns": DispatchTime.now().uptimeNanoseconds,
+            "event_wall_ms": Int(Date().timeIntervalSince1970 * 1000),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: entry),
+              let line = String(data: data, encoding: .utf8) else { return }
+        let lineWithNewline = line + "\n"
+        if let fh = FileHandle(forWritingAtPath: uiMetricsPath) {
+            fh.seekToEndOfFile()
+            fh.write(lineWithNewline.data(using: .utf8) ?? Data())
+            fh.closeFile()
+        } else {
+            try? lineWithNewline.write(toFile: uiMetricsPath, atomically: false, encoding: .utf8)
         }
     }
 

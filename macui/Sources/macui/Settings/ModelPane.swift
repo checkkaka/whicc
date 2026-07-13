@@ -140,6 +140,31 @@ struct ModelPane: View {
                 )
             }
 
+            // Nemotron look-ahead 三档：仅在非中文槽为 Nemotron 时有意义
+            SettingsCard {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Nemotron 延迟档位")
+                        .font(.callout.weight(.medium))
+                    Text("WER 数字仅代表官方 FLEURS 英语 Auto；中日文质量以本项目回放结果为准。改档会重启 ASR 后端。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Picker("look-ahead", selection: Binding(
+                        get: { langConfig.nemotronRightContext },
+                        set: { newValue in
+                            langConfig.setNemotronRightContext(newValue)
+                            Self.restartASRBackend()
+                        }
+                    )) {
+                        Text("极速 · [56,3] · 320ms · EN Auto 8.84").tag(3)
+                        Text("均衡 · [56,6] · 560ms · EN Auto 8.80").tag(6)
+                        Text("质量 · [56,13] · 1.12s · EN Auto 8.84").tag(13)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.radioGroup)
+                    .disabled(!modelState.nonChineseASR.localizedCaseInsensitiveContains("nemotron"))
+                }
+            }
+
             // 下载进度条（统一展示，跟 model_state.json 槽位选择无关）
             // macOS HIG:
             // - 不要阻挡用户（不弹全屏 modal）

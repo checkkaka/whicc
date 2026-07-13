@@ -27,12 +27,26 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 
 from config import SAMPLE_RATE, SYSTEM_AUDIO_STALL_SEC
 
 SENTINEL = None  # putting this on the queue signals the audio stream has ended
+
+
+@dataclass
+class AudioChunk:
+    """带采集完成单调时间戳的音频块(仅用于延迟度量,不参与断句)。"""
+
+    samples: np.ndarray
+    captured_mono_ns: int
+
+    @classmethod
+    def from_samples(cls, samples: np.ndarray) -> "AudioChunk":
+        # 记录采集完成时刻：供开口→草稿等延迟口径关联
+        return cls(samples=samples, captured_mono_ns=time.monotonic_ns())
 
 
 class AudioteeWaitingError(RuntimeError):
@@ -71,10 +85,12 @@ class AudioSource(ABC):
     def stop(self) -> None: ...
 
     def _offer(self, samples: np.ndarray) -> None:
-        """Enqueue a live frame: 队列满了丢最旧,不阻塞采集侧。"""
+        """Enqueue a live frame(AudioChunk): 队列满了丢最旧,不阻塞采集侧。"""
+        # 包装为带采集时间戳的块：度量开口延迟,不影响下游断句逻辑
+        item = AudioChunk.from_samples(samples)
         while True:
             try:
-                self.queue.put_nowait(samples)
+                self.queue.put_nowait(item)
                 return
             except queue.Full:
                 with contextlib.suppress(queue.Empty):

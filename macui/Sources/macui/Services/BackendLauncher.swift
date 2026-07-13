@@ -110,6 +110,7 @@ final class BackendLauncher {
                     "--language", "auto",
                     "--audio-source", "system",
                     "--audio-bin", audioteePath,
+                    "--lang-config", runDir + "/lang_config.json",
                 ],
                 logName: "whicc.log"
             ),
@@ -489,6 +490,23 @@ final class BackendLauncher {
         }
         if json["target_lang"] == nil {
             json["target_lang"] = "auto"
+            modified = true
+        }
+        if json["nemotron_right_context"] == nil {
+            json["nemotron_right_context"] = 6
+            modified = true
+        }
+        if json["translation_priority_enabled"] == nil {
+            json["translation_priority_enabled"] = true
+            modified = true
+        }
+        if json["probe_partial_enabled"] == nil {
+            json["probe_partial_enabled"] = true
+            modified = true
+        }
+        if json["nemotron_native_streaming_enabled"] == nil {
+            // 原生流式通过验收前默认关闭；关闭时完整回到批处理探针链路
+            json["nemotron_native_streaming_enabled"] = false
             modified = true
         }
 
