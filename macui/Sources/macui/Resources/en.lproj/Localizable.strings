@@ -34,6 +34,14 @@
 "目标应用" = "Target app";
 "刷新应用列表" = "Refresh app list";
 "当前没有可选择的运行中应用" = "No eligible running apps";
+"请选择应用" = "Choose an app";
+"%@（未运行）" = "%@ (not running)";
+"请先选择一个正在运行的应用" = "Please choose a running app first";
+"当前采集：麦克风" = "Capturing: microphone";
+"当前采集：指定应用（尚未选择）" = "Capturing: specific app (none selected)";
+"当前采集：%@" = "Capturing: %@";
+"等待 %@ 启动" = "Waiting for %@ to launch";
+"当前采集：全部系统音频" = "Capturing: all system audio";
 
 /* main.swift — window title + NSMenu items */
 "settings_window_title" = "Settings";

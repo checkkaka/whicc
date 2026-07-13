@@ -566,6 +566,9 @@ class EventLogger:
 
     def __init__(self, path: str):
         self.path = path
+        # audio.py 的采集线程(status_callback)与主循环共用同一 logger,
+        # 加锁防止 JSONL 行交错损坏(Swift EventWatcher 按行解析)。
+        self._write_lock = threading.Lock()
         if path:
             dirname = os.path.dirname(path)
             if dirname:
@@ -576,8 +579,10 @@ class EventLogger:
 
     def write(self, event: dict):
         if self._f:
-            self._f.write(json.dumps(event, ensure_ascii=False) + "\n")
-            self._f.flush()
+            line = json.dumps(event, ensure_ascii=False) + "\n"
+            with self._write_lock:
+                self._f.write(line)
+                self._f.flush()
 
     def log_status(self, status: str, **extra):
         event = {"event_type": "status", "status": status}
@@ -859,9 +864,10 @@ def main():
         return mode, bundle_id, display_name
 
     startup_mode, startup_bundle, startup_name = _read_audio_app_config()
-    # BackendLauncher 常固定传 --audio-source system;以 lang_config 为准恢复
-    # 用户上次选择的 application/mic(segdir 离线评估除外)。
-    if args.audio_source != "segdir" and startup_mode in (
+    # BackendLauncher 固定传 --audio-source system(argparse 默认值同为
+    # system),只在这种情况下用 lang_config 恢复用户上次选择;显式传
+    # --audio-source mic / segdir 的开发调试用法保持原语义不被覆盖。
+    if args.audio_source == "system" and startup_mode in (
         "system", "mic", "application"
     ):
         args.audio_source = startup_mode
@@ -1051,7 +1057,14 @@ def main():
         失败时 log error 但不崩溃 (whicc.py 继续跑 — 用户改错了能重试)。
         """
         nonlocal audio_source
-        with _audio_swap_lock:
+        # 非阻塞取锁:SIGHUP handler 在主线程同步执行,若上一个 swap 还在
+        # 进行中(锁被同线程外层持有),阻塞 acquire 会自我死锁。取不到锁
+        # 直接放弃本次 swap——Swift 侧连点时后到的信号丢弃是安全的,
+        # 用户最后一次点击落盘的配置会在下一个 SIGHUP 生效。
+        if not _audio_swap_lock.acquire(blocking=False):
+            logger.log_status("audio swap busy, ignored")
+            return
+        try:
             if audio_source is None:
                 return  # segdir 模式没有进程内 source,不支持热切换
             if new_mode not in ("system", "mic", "application"):
@@ -1060,13 +1073,15 @@ def main():
             if new_mode == "application" and not bundle_id:
                 logger.log_status("application mode missing bundle_id")
                 return
-            # 同 mode + 同 bundle 无需重启。
+            # 同 mode + 同 bundle 无需重启;但 source 已进入 failed 态
+            # (supervisor 三连败停机)时放行,让用户重选同一应用能复活捕获。
+            source_failed = bool(getattr(audio_source, "failed", False))
             same_app = (
                 new_mode == "application"
                 and getattr(audio_source, "bundle_id", None) == bundle_id
                 and audio_source.label == "application"
             )
-            if audio_source.label == new_mode and (
+            if (not source_failed) and audio_source.label == new_mode and (
                 new_mode != "application" or same_app
             ):
                 return
@@ -1075,12 +1090,9 @@ def main():
                 # 旧 source 停 = 它把 SENTINEL 放进自己的 queue,主循环
                 # drain 到 SENTINEL 就知道这段流结束,换读新 source 的 queue。
                 old_source.stop()
-                # macOS Core Audio process tap: 旧 audiotee 退出后,新
-                # audiotee 启动时 macOS 26 不会重新授权 process tap
-                # (TCC 静默返回 0 字节 → ~8s 后被 audio.py stall 检测
-                # 杀掉)。等 1s 让 Core Audio 回收 tap 注册再起新 source。
-                if old_source.label in ("system", "application"):
-                    time.sleep(1.0)
+                # 注:audiotee 的 kill→respawn 之间的 TCC 冷却等待已下沉到
+                # audio.py _spawn_shared_unlocked(kill 与 spawn 之间),这里
+                # 不再 sleep —— stop() 本身不杀 audiotee,在这睡等不到任何事。
                 # 创建新 source。mic-device 跟首次启动同 (无变更)。
                 new_source = make_source(
                     mode=new_mode,
@@ -1106,6 +1118,8 @@ def main():
                 logger.log_status(f"audio swap to {new_mode} failed: {e}")
                 # new_source.start() 失败时 audio_source 引用未替换,
                 # 主循环继续读旧 source 的 queue(降级,用户可重试)
+        finally:
+            _audio_swap_lock.release()
 
     def _sighup_audio_swap(_signum, _frame) -> None:
         """SIGHUP handler — 读 lang_config.json + swap audio source。
@@ -1435,7 +1449,16 @@ def main():
             # (实测),比等 30s 少断流 18s。
             now = time.monotonic()
             # 收到首段数据后才开始计时;启动期静音不退出。
-            if last_data_time is not None and now - last_data_time > 12.0:
+            # application 模式等待目标应用启动/出声是正常态(可能持续数
+            # 分钟),此期间豁免看门狗 —— 否则 12s 无数据就 exit(4) 重启
+            # 整个后端,违反「保持等待,不回退」的语义。
+            waiting_for_app = bool(
+                audio_source is not None
+                and getattr(audio_source, "waiting_for_app", False)
+            )
+            if waiting_for_app:
+                last_data_time = None  # 等待结束后重新计时
+            elif last_data_time is not None and now - last_data_time > 12.0:
                 print(f"\n[error] 音频源 12s 无数据(audiotee 重启也没救回),"
                       "退出换新进程重新授权 process tap。",
                       file=sys.stderr, flush=True)

@@ -186,7 +186,7 @@ final class AudioTeeRuntime {
   }
 
   func start() throws {
-    try applyConfiguration(includeProcesses: includeProcesses, allowWaitingExit: true)
+    try applyConfiguration(includeProcesses: includeProcesses)
   }
 
   func stop() {
@@ -225,9 +225,15 @@ final class AudioTeeRuntime {
           if let s = value as? String { return Int32(s) }
           return nil
         }
+        // Reject empty include lists: reconfiguring to "no processes" must
+        // never silently widen the tap to all system audio.
+        if pids.isEmpty {
+          emitReconfigure(status: "error", detail: "empty_pids_rejected")
+          continue
+        }
         DispatchQueue.main.async {
           do {
-            try self.applyConfiguration(includeProcesses: pids, allowWaitingExit: false)
+            try self.applyConfiguration(includeProcesses: pids)
             self.emitReconfigure(
               status: "ok",
               detail: pids.map(String.init).joined(separator: ","))
@@ -264,7 +270,7 @@ final class AudioTeeRuntime {
     }
   }
 
-  private func applyConfiguration(includeProcesses: [Int32], allowWaitingExit: Bool) throws {
+  private func applyConfiguration(includeProcesses: [Int32]) throws {
     lock.lock()
     defer { lock.unlock() }
 
@@ -275,9 +281,6 @@ final class AudioTeeRuntime {
 
     // Never silently widen to "all processes" when the parent asked for includes.
     if !includeProcesses.isEmpty && processes.isEmpty {
-      if allowWaitingExit {
-        throw ExitCode.waitingForAudioObjects
-      }
       throw ExitCode.waitingForAudioObjects
     }
 
