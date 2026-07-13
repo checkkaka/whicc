@@ -11,6 +11,9 @@ struct AudioSourcePane: View {
 
     @State private var apps: [AppRow] = []
     @State private var statusHint: String = ""
+    /// 用户点了「指定应用」但还没选目标：先展开列表让用户挑，
+    /// 不写盘、不切采集 —— 避免自动选中第一个应用导致误捕获。
+    @State private var applicationModeArmed = false
 
     struct AppRow: Identifiable, Hashable {
         let id: String  // bundle id
@@ -53,7 +56,7 @@ struct AudioSourcePane: View {
                 }
 
                 modeCard
-                if langConfig.audioSource == AudioSource.application.rawValue {
+                if isApplicationModeVisible {
                     appPickerCard
                 }
                 statusCard
@@ -94,6 +97,7 @@ struct AudioSourcePane: View {
                     title: "指定应用",
                     subtitle: "只捕获所选应用产生的音频",
                     selected: langConfig.audioSource == AudioSource.application.rawValue
+                        || applicationModeArmed
                 ) {
                     applyMode(.application)
                 }
@@ -147,12 +151,26 @@ struct AudioSourcePane: View {
                 }
             )
 
-            if apps.isEmpty {
+            if apps.isEmpty && langConfig.audioAppBundleId.isEmpty {
                 Text("当前没有可选择的运行中应用")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
                 Picker("应用", selection: appSelection) {
+                    // 未选择时的占位项 — 不自动替用户选第一个应用。
+                    if langConfig.audioAppBundleId.isEmpty {
+                        Text("请选择应用").tag("")
+                    }
+                    // 已选应用当前未运行：保留 Bundle ID(等待重启),
+                    // 用占位条目让 picker 显示与状态卡一致。
+                    if !langConfig.audioAppBundleId.isEmpty,
+                       !apps.contains(where: { $0.id == langConfig.audioAppBundleId })
+                    {
+                        let name = langConfig.audioAppDisplayName.isEmpty
+                            ? langConfig.audioAppBundleId
+                            : langConfig.audioAppDisplayName
+                        Text("\(name)（未运行）").tag(langConfig.audioAppBundleId)
+                    }
                     ForEach(apps) { app in
                         HStack(spacing: 8) {
                             if let icon = app.icon {
@@ -181,15 +199,14 @@ struct AudioSourcePane: View {
         }
     }
 
+    /// application 模式已激活，或用户刚点了「指定应用」等待选目标。
+    private var isApplicationModeVisible: Bool {
+        langConfig.audioSource == AudioSource.application.rawValue || applicationModeArmed
+    }
+
     private var appSelection: Binding<String> {
         Binding(
-            get: {
-                let current = langConfig.audioAppBundleId
-                if apps.contains(where: { $0.id == current }) {
-                    return current
-                }
-                return apps.first?.id ?? ""
-            },
+            get: { langConfig.audioAppBundleId },
             set: { bundleId in
                 guard let row = apps.first(where: { $0.id == bundleId }) else { return }
                 selectApp(row)
@@ -217,19 +234,24 @@ struct AudioSourcePane: View {
     private var statusText: String {
         switch langConfig.audioSource {
         case AudioSource.mic.rawValue:
-            return "当前采集：麦克风"
+            return NSLocalizedString("当前采集：麦克风", comment: "audio status")
         case AudioSource.application.rawValue:
             let name = langConfig.audioAppDisplayName
             if name.isEmpty {
-                return "当前采集：指定应用（尚未选择）"
+                return NSLocalizedString("当前采集：指定应用（尚未选择）",
+                                         comment: "audio status")
             }
             let running = apps.contains { $0.id == langConfig.audioAppBundleId }
             if running {
-                return "当前采集：\(name)"
+                return String(
+                    format: NSLocalizedString("当前采集：%@", comment: "audio status"),
+                    name)
             }
-            return "等待 \(name) 启动"
+            return String(
+                format: NSLocalizedString("等待 %@ 启动", comment: "audio status"),
+                name)
         default:
-            return "当前采集：全部系统音频"
+            return NSLocalizedString("当前采集：全部系统音频", comment: "audio status")
         }
     }
 
@@ -237,15 +259,17 @@ struct AudioSourcePane: View {
 
     private func applyMode(_ mode: AudioSource) {
         if mode == .application {
-            if langConfig.audioAppBundleId.isEmpty, let first = apps.first {
-                langConfig.setAudioApplication(bundleId: first.id, displayName: first.name)
-            }
+            refreshApps()
+            // 不自动替用户选应用:没有已保存目标时只「预备」该模式,
+            // 展开列表等用户明确选择后(selectApp)才写盘 + SIGHUP。
             if langConfig.audioAppBundleId.isEmpty {
-                statusHint = "请先选择一个正在运行的应用"
-                refreshApps()
+                applicationModeArmed = true
+                statusHint = NSLocalizedString("请先选择一个正在运行的应用",
+                                               comment: "audio hint")
                 return
             }
         }
+        applicationModeArmed = false
         statusHint = ""
         langConfig.setAudioSource(mode.rawValue)
         overlayState.audioSource = mode
@@ -259,6 +283,7 @@ struct AudioSourcePane: View {
             langConfig.setAudioSource(AudioSource.application.rawValue)
             overlayState.audioSource = .application
         }
+        applicationModeArmed = false
         statusHint = ""
         BackendShutdown.signalWhiccForAudioSwitch()
     }
@@ -291,13 +316,7 @@ struct AudioSourcePane: View {
             return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
         apps = rows
-
-        // 若当前选中的应用不在列表里，保留 Bundle ID（等待重启），不强行清空。
-        if langConfig.audioSource == AudioSource.application.rawValue,
-           langConfig.audioAppBundleId.isEmpty,
-           let first = rows.first
-        {
-            langConfig.setAudioApplication(bundleId: first.id, displayName: first.name)
-        }
+        // 注意:刷新只更新列表,绝不代用户写盘选应用 —— 目标不在列表时
+        // 保留 Bundle ID(等待应用重启),由 picker 的「未运行」占位展示。
     }
 }

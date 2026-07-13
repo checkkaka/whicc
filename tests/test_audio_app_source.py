@@ -40,8 +40,63 @@ def test_make_source_system_label():
     assert src.bundle_id is None
 
 
-def test_include_processes_cli_shape():
+def test_build_audiotee_cmd_multi_pid_shape():
     """Multi-PID must be one flag + many values (AudioTee array option)."""
-    pids = [10, 11, 12]
-    cmd = ["audiotee", "--sample-rate", "16000", "--include-processes", *[str(p) for p in pids]]
-    assert cmd[cmd.index("--include-processes") + 1 :] == ["10", "11", "12"]
+    import audio
+
+    cmd = audio.build_audiotee_cmd("/bin/audiotee", [10, 11, 12])
+    idx = cmd.index("--include-processes")
+    assert cmd[idx + 1 :] == ["10", "11", "12"]
+    # flag 只出现一次
+    assert cmd.count("--include-processes") == 1
+    assert cmd[:3] == ["/bin/audiotee", "--sample-rate", "16000"]
+
+
+def test_build_audiotee_cmd_no_pids():
+    import audio
+
+    cmd = audio.build_audiotee_cmd("/bin/audiotee")
+    assert "--include-processes" not in cmd
+
+
+def test_waiting_for_app_property():
+    """application 模式无活跃 audiotee = 等待态;system 模式恒 False。"""
+    import audio
+
+    app_src = audio.make_source(
+        "application",
+        audiotee_path="/tmp/missing-audiotee",
+        bundle_id="com.example.Foo",
+    )
+    sys_src = audio.make_source("system", audiotee_path="/tmp/missing-audiotee")
+    # 无共享 audiotee 进程时:application 等待中,system 不算等待。
+    audio.SystemAudioSource._shared_proc = None
+    assert app_src.waiting_for_app is True
+    assert sys_src.waiting_for_app is False
+
+
+def test_reconfigure_requires_ack(monkeypatch):
+    """stdin 写成功但无 ack(旧二进制)必须判失败并停用热重配。"""
+    import io
+
+    import audio
+
+    src = audio.make_source(
+        "application",
+        audiotee_path="/tmp/missing-audiotee",
+        bundle_id="com.example.Foo",
+    )
+
+    class FakeProc:
+        stdin = io.BytesIO()
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(audio.SystemAudioSource, "_shared_proc", FakeProc())
+    monkeypatch.setattr(audio.SystemAudioSource, "_RECONFIG_ACK_SEC", 0.05)
+    assert src._try_reconfigure({1, 2}) is False
+    assert src._reconfig_unsupported is True
+    # 已标记不支持后直接短路
+    assert src._try_reconfigure({3}) is False

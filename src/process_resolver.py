@@ -115,7 +115,7 @@ def _run_lsappinfo(*args: str) -> str:
 
 
 def _parse_lsappinfo_kv(blob: str) -> dict[str, str]:
-    """Parse ``lsappinfo info -only …`` style ``key=value`` lines."""
+    """Parse ``lsappinfo info`` style ``"key"="value"`` lines."""
     result: dict[str, str] = {}
     for raw in blob.splitlines():
         line = raw.strip()
@@ -130,24 +130,46 @@ def _parse_lsappinfo_kv(blob: str) -> dict[str, str]:
     return result
 
 
+def _kv_first(kv: dict[str, str], *keys: str) -> str:
+    """按别名顺序取第一个非空值。lsappinfo 实际键名随 macOS 版本变化
+    (如 LSDisplayName / LSBundlePath / CFBundleIdentifier),全部列入别名。"""
+    for key in keys:
+        val = kv.get(key)
+        if val:
+            return val
+    return ""
+
+
+# lsappinfo info 输出键名别名（不同 macOS 版本/查询方式下观测到的变体）。
+_NAME_KEYS = ("LSDisplayName", "display name", "name", "CFBundleName")
+_BUNDLE_PATH_KEYS = ("LSBundlePath", "bundle path", "bundlepath", "CFBundlePath",
+                     "executable path")
+_BUNDLE_ID_KEYS = ("CFBundleIdentifier", "bundleID", "bundleid")
+_PID_KEYS = ("pid", "PID")
+
+
+def _lsappinfo_info(asn: str) -> dict[str, str]:
+    """取单个 ASN 的完整 info(不用 -only,避免键名过滤踩版本差异)。"""
+    return _parse_lsappinfo_kv(_run_lsappinfo("info", asn))
+
+
 def find_app_by_bundle_id(bundle_identifier: str) -> tuple[str, str, int] | None:
     """Return ``(display_name, bundle_path, main_pid)`` for a running Bundle ID."""
     if not bundle_identifier:
         return None
     asn_blob = _run_lsappinfo("find", f"bundleid={bundle_identifier}")
-    asns = [line.strip() for line in asn_blob.splitlines() if line.strip()]
+    asns = re.findall(r"ASN:[^\s\"]+", asn_blob) or [
+        line.strip() for line in asn_blob.splitlines() if line.strip()
+    ]
     if not asns:
         return None
-    info = _run_lsappinfo(
-        "info",
-        "-only",
-        "name,bundlepath,pid,bundleid",
-        asns[0],
-    )
-    kv = _parse_lsappinfo_kv(info)
-    bundle_path = kv.get("bundlepath") or kv.get("CFBundlePath") or ""
-    name = kv.get("name") or kv.get("CFBundleName") or bundle_identifier
-    pid_raw = kv.get("pid") or kv.get("PID") or ""
+    kv = _lsappinfo_info(asns[0])
+    bundle_path = _kv_first(kv, *_BUNDLE_PATH_KEYS)
+    # executable path 形如 …/Foo.app/Contents/MacOS/Foo,截到 .app 根。
+    if bundle_path and ".app/" in bundle_path and not bundle_path.endswith(".app"):
+        bundle_path = bundle_path.split(".app/", 1)[0] + ".app"
+    name = _kv_first(kv, *_NAME_KEYS) or bundle_identifier
+    pid_raw = _kv_first(kv, *_PID_KEYS)
     try:
         pid = int(pid_raw)
     except ValueError:
@@ -239,25 +261,24 @@ def list_running_applications(
     """List regular running GUI apps via ``lsappinfo`` (best-effort)."""
     exclude = set(exclude_bundle_ids or ())
     blob = _run_lsappinfo("list")
-    asns = re.findall(r"ASN:[\w.:]+", blob)
+    asns = re.findall(r"ASN:[^\s\"]+", blob)
     apps: list[RunningApplicationInfo] = []
     seen: set[str] = set()
     for asn in asns:
-        info = _run_lsappinfo("info", "-only", "name,bundlepath,pid,bundleid", asn)
-        kv = _parse_lsappinfo_kv(info)
-        bid = kv.get("bundleid") or kv.get("CFBundleIdentifier") or ""
+        kv = _lsappinfo_info(asn)
+        bid = _kv_first(kv, *_BUNDLE_ID_KEYS)
         if not bid or bid in exclude or bid in seen:
             continue
-        bpath = kv.get("bundlepath") or ""
+        bpath = _kv_first(kv, *_BUNDLE_PATH_KEYS)
         if bpath and ".app" not in bpath:
             continue
         try:
-            pid = int(kv.get("pid") or "0")
+            pid = int(_kv_first(kv, *_PID_KEYS) or "0")
         except ValueError:
             pid = 0
         if pid <= 0:
             continue
-        name = kv.get("name") or bid
+        name = _kv_first(kv, *_NAME_KEYS) or bid
         seen.add(bid)
         apps.append(
             RunningApplicationInfo(
