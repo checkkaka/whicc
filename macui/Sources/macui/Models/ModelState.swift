@@ -27,8 +27,8 @@ import AppKit
 /// - `model_state.json`: `/tmp/whicc-out/model_state.json`
 ///   （与 lang_config.json 同款：共享给 Python 端）
 ///
-/// Python 端暂时**不**读 chinese_asr / non_chinese_asr 字段（按用户
-/// 2026-06-24 决定先不动 Python 端）；这两个字段目前是 macui 内部状态。
+/// Python 端读取 chinese_asr / non_chinese_asr；空槽位分别回退项目内置
+/// Qwen3 / Nemotron，设置页修改后通过现有后端重启链生效。
 final class ModelState: ObservableObject {
 
     struct ModelInfo: Identifiable, Equatable {

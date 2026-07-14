@@ -108,6 +108,7 @@ final class BackendLauncher {
                     "--models-dir", modelsDir,
                     "--model", defaultModel,
                     "--language", "auto",
+                    "--lang-config", runDir + "/lang_config.json",
                     "--audio-source", "system",
                     "--audio-bin", audioteePath,
                 ],
@@ -489,6 +490,22 @@ final class BackendLauncher {
         }
         if json["target_lang"] == nil {
             json["target_lang"] = "auto"
+            modified = true
+        }
+        if json["nemotron_right_context"] == nil {
+            json["nemotron_right_context"] = 6
+            modified = true
+        }
+        if json["translation_priority_enabled"] == nil {
+            json["translation_priority_enabled"] = true
+            modified = true
+        }
+        if json["probe_partial_enabled"] == nil {
+            json["probe_partial_enabled"] = true
+            modified = true
+        }
+        if json["nemotron_native_streaming_enabled"] == nil {
+            json["nemotron_native_streaming_enabled"] = false
             modified = true
         }
 

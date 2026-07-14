@@ -169,6 +169,10 @@ final class OverlayState: ObservableObject {
     @Published var draftSourceText: String?
     @Published var draftTranslatedText: String?
     @Published var draftStablePrefixLen: Int = 0
+    /// 当前草稿所属句子及版本；final/partial 独立 worker 可能乱序到达，
+    /// 旧句 final 和同句旧 revision 都不能覆盖已经显示的新草稿。
+    private var draftSourceKey: String?
+    private var draftSourceRevision: Int?
 
     /// History (most-recent last), capped at 80.
     @Published var history: [OverlayCaption] = []
@@ -197,6 +201,7 @@ final class OverlayState: ObservableObject {
     private static var lostDraftsPath: String { AppPaths.runDir + "/lost_drafts.jsonl" }
     private var pendingDraftSrc: String?
     private var pendingDraftTrans: String?
+    private var pendingDraftKey: String?
     private var pendingDraftTs: Double = 0
 
     // Font sizes
@@ -350,7 +355,7 @@ final class OverlayState: ObservableObject {
 
     /// Apply a translation event from `translation_events.jsonl`.
     /// 这个 watcher 处理的事件类型(由 translate_stream.py 写入):
-    /// - translation_partial (含 streaming token)
+    /// - translation_partial（后端按 source_key 最多约 1 次/秒展示的累计全文）
     /// - translation_final / translation_reset
     /// - translation_error
     /// - init-* (启动 banner ping,见 BackendLauncher.writeStartupPings)
@@ -374,33 +379,29 @@ final class OverlayState: ObservableObject {
         case "translation_final", "translation_reset":
             applyFinal(event)
         case "translation_partial":
-            // Streaming-token events carry the cumulative translation
-            // in `translatedFullText`. Skip the stable-prefix /
-            // deduplication machinery in applyPartial — the caller
-            // wants the latest cumulative verbatim, not the
-            // partial diff against an earlier snapshot. Legacy
-            // (non-streaming) partials still go through the
-            // diff-based path.
+            // 两个 JSONL watcher 可乱序：下一句 ASR 草稿已经显示时，
+            // 上一句慢翻译不能倒灌；若同一 run 的更高 sequence 翻译先于
+            // ASR watcher 到达，则允许它推进到新句。
+            guard canApplyTranslationDraft(event) else { break }
+            // 后端已对跨 revision 整段改写统一限流；这里跳过旧 delta 合并，
+            // 直接替换并由 source_key/revision 门禁阻止字幕倒退。
             if event.isStreamingToken == true,
                let full = event.translatedFullText {
+                if let source = event.sourceText, !source.isEmpty {
+                    draftSourceText = Self.deduplicateRepeated(source)
+                }
                 draftTranslatedText = full
-                // draftStablePrefixLen is intentionally left alone —
-                // streaming tokens are append-only, so the "stable"
-                // prefix is whatever was stable before the stream
-                // started.
+                updateDraftIdentity(from: event)
             } else {
                 applyPartial(event)
             }
+            logUIMetric(event, appliedKind: "translation_draft")
         case "translation_error":
             totalErrors += 1
 
         // Whicc transcription events (already-merged pipeline)
         case "partial":
-            if let text = event.text, !text.isEmpty {
-                draftSourceText = Self.deduplicateRepeated(text)
-                draftStablePrefixLen = 0
-                draftTranslatedText = nil
-            }
+            applySourceDraft(event, logMetric: false)
         case "final":
             if let text = event.text, !text.isEmpty {
                 let key = event.sourceKey ?? UUID().uuidString
@@ -420,7 +421,9 @@ final class OverlayState: ObservableObject {
                     }
                     committed = caption
                 }
-                clearDraft()
+                if draftSourceKey == nil || draftSourceKey == key {
+                    clearDraft()
+                }
                 totalTranslated += 1
             }
         case "status":
@@ -451,19 +454,12 @@ final class OverlayState: ObservableObject {
     /// → ASR final 没人接 → 字幕卡 draft。这是 dev mode 期望行为还是 bug,
     /// 留给 P0 #5 决定;此处不动避免误改产品语义。
     ///
-    /// draft 清理:draftTranslatedText 可能在翻译模式残留(用户切回纯 ASR)。
-    /// partial 来时只在残留非 nil 时清,纯 ASR 模式下 draftTranslatedText
-    /// 始终 nil,跳过无意义的写。
+    /// 同一 source_key 的新 ASR revision 暂时保留上一版译文，直到对应
+    /// 翻译到达再替换；新 source_key 则立即清空上一句译文和 pending 草稿。
     func applyTranscription(_ event: TranslationEvent) {
         switch event.eventType {
         case "partial":
-            if let text = event.text, !text.isEmpty {
-                draftSourceText = Self.deduplicateRepeated(text)
-                draftStablePrefixLen = 0
-                if draftTranslatedText != nil {
-                    draftTranslatedText = nil
-                }
-            }
+            applySourceDraft(event, logMetric: true)
         case "status":
             handleStatus(event.status ?? "", colorKey: event.statusColor)
         default:
@@ -474,6 +470,56 @@ final class OverlayState: ObservableObject {
     }
 
     // MARK: - Draft → Final
+
+    private func applySourceDraft(_ event: TranslationEvent, logMetric: Bool) {
+        guard let text = event.text, !text.isEmpty else { return }
+        if event.sourceKey == draftSourceKey, let currentRevision = draftSourceRevision {
+            guard let revision = event.revision, revision >= currentRevision else { return }
+        } else {
+            clearDraft()
+            pendingDraftSrc = nil
+            pendingDraftTrans = nil
+            pendingDraftKey = nil
+            pendingDraftTs = 0
+        }
+        draftSourceText = Self.deduplicateRepeated(text)
+        draftStablePrefixLen = 0
+        updateDraftIdentity(from: event)
+        if logMetric { logUIMetric(event, appliedKind: "source_draft") }
+    }
+
+    private func canApplyTranslationDraft(_ event: TranslationEvent) -> Bool {
+        if let incoming = event.sourceKey, committed?.id == incoming {
+            return false
+        }
+        guard let current = draftSourceKey,
+              let incoming = event.sourceKey else { return true }
+        if incoming == current {
+            guard let currentRevision = draftSourceRevision else { return true }
+            guard let incomingRevision = event.revision else { return false }
+            return incomingRevision >= currentRevision
+        }
+        guard let currentParts = Self.sourceKeyParts(current),
+              let incomingParts = Self.sourceKeyParts(incoming),
+              currentParts.run == incomingParts.run else { return false }
+        return incomingParts.sequence > currentParts.sequence
+    }
+
+    private static func sourceKeyParts(_ key: String) -> (run: String, sequence: Int)? {
+        guard let colon = key.lastIndex(of: ":"),
+              let sequence = Int(key[key.index(after: colon)...]) else { return nil }
+        return (String(key[..<colon]), sequence)
+    }
+
+    private func updateDraftIdentity(from event: TranslationEvent) {
+        guard let key = event.sourceKey else { return }
+        if key != draftSourceKey {
+            draftSourceRevision = event.revision
+        } else if let revision = event.revision {
+            draftSourceRevision = revision
+        }
+        draftSourceKey = key
+    }
 
     private func applyPartial(_ event: TranslationEvent) {
         let src = event.sourceText ?? event.deltaSourceText ?? ""
@@ -490,10 +536,12 @@ final class OverlayState: ObservableObject {
         if !src.isEmpty { draftSourceText = Self.deduplicateRepeated(src) }
         draftTranslatedText = trans.map { Self.deduplicateRepeated($0) }
         draftStablePrefixLen = event.sharedPrefixLen ?? 0
+        updateDraftIdentity(from: event)
 
         if let t = trans, !t.isEmpty {
             pendingDraftSrc = src
             pendingDraftTrans = t
+            pendingDraftKey = event.sourceKey
             pendingDraftTs = Date().timeIntervalSince1970
         }
     }
@@ -520,12 +568,18 @@ final class OverlayState: ObservableObject {
             }
             committed = caption
         }
-        clearDraft()
-        pendingDraftSrc = nil
-        pendingDraftTrans = nil
+        if draftSourceKey == nil || draftSourceKey == key {
+            clearDraft()
+        }
+        if pendingDraftKey == nil || pendingDraftKey == key {
+            pendingDraftSrc = nil
+            pendingDraftTrans = nil
+            pendingDraftKey = nil
+        }
         totalTranslated += 1
         // Real subtitle arrived — dismiss the startup banner.
         dismissStartupBanner(animated: true)
+        logUIMetric(event, appliedKind: "translation_final")
     }
 
     // MARK: - Startup banner
@@ -600,6 +654,8 @@ final class OverlayState: ObservableObject {
         draftSourceText = nil
         draftTranslatedText = nil
         draftStablePrefixLen = 0
+        draftSourceKey = nil
+        draftSourceRevision = nil
     }
 
     // MARK: - Visibility controls
@@ -760,6 +816,28 @@ final class OverlayState: ObservableObject {
             fh.closeFile()
         } else {
             try? lineWithNewline.write(toFile: Self.lostDraftsPath, atomically: false, encoding: .utf8)
+        }
+    }
+
+    /// 状态真正更新后记录 UI apply 时刻，供端到端延迟报表关联。
+    private func logUIMetric(_ event: TranslationEvent, appliedKind: String) {
+        var entry: [String: Any] = [
+            "event_type": appliedKind,
+            "ui_apply_mono_ns": DispatchTime.now().uptimeNanoseconds,
+            "ui_apply_wall_ms": Int(Date().timeIntervalSince1970 * 1000),
+        ]
+        if let key = event.sourceKey { entry["source_key"] = key }
+        if let revision = event.revision { entry["revision"] = revision }
+        if let eventMonoNs = event.eventMonoNs { entry["source_event_mono_ns"] = eventMonoNs }
+        guard let data = try? JSONSerialization.data(withJSONObject: entry),
+              let line = String(data: data, encoding: .utf8)?.appending("\n") else { return }
+        let path = AppPaths.runDir + "/ui_metrics.jsonl"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            fh.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: false, encoding: .utf8)
         }
     }
 

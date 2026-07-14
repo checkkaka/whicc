@@ -14,14 +14,8 @@ import AppKit
 /// - 列出 ~/Library/Application Support/whicc/models/ 下的子目录
 /// - 每个模型显示：名字、大小、backend 类型、已分配到哪个槽位
 ///
-/// Python 端**不**读 chinese_asr / non_chinese_asr 字段（按用户
-/// 2026-06-24 决定先不动 Python 端）；这两个槽位目前仅 macui 内部
-/// 表示用户的"我希望中文用 X / 非中文用 Y"的意图。
-///
-/// 阶段 2/3 计划（不在这里实现）：
-/// - Python 端按槽位选择模型
-/// - 模型下载 UI（HF 模型 ID 输入框 + 进度条）
-/// - 远程模型（OpenAI-compatible API）
+/// Python 端读取 chinese_asr / non_chinese_asr：非中文槽为空时使用
+/// 默认 Nemotron，检测到中文/日文后按中文槽切换 Qwen3。
 struct ModelPane: View {
     @ObservedObject var modelState: ModelState
     @ObservedObject var downloadState: ModelDownloadState
@@ -138,6 +132,29 @@ struct ModelPane: View {
                     isCurrentReady: isFullyDownloaded(modelState.nonChineseASR),
                     onDownload: { downloadState.requestDownload(modelId: $0) }
                 )
+            }
+
+            SettingsCard {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Nemotron 实时延迟")
+                        .font(.system(size: 12, weight: .semibold))
+                    Picker("右上下文", selection: Binding(
+                        get: { langConfig.nemotronRightContext },
+                        set: {
+                            langConfig.setNemotronRightContext($0)
+                            Self.restartASRBackend()
+                        }
+                    )) {
+                        Text("320ms · [56,3]").tag(3)
+                        Text("560ms · [56,6]（默认）").tag(6)
+                        Text("1.12s · [56,13]（质量）").tag(13)
+                    }
+                    .disabled(!Self.usesNemotron(
+                        nonChineseASR: modelState.nonChineseASR))
+                    Text("三档英语 Auto WER 近似持平；中日文质量需以同批音频 A/B 为准。修改后自动重启识别后端。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
 
             // 下载进度条（统一展示，跟 model_state.json 槽位选择无关）
@@ -265,6 +282,12 @@ struct ModelPane: View {
     /// 与 whicc.py:28 `DEFAULT_MODEL` + whicc.py:33 `QWEN3_MODEL` 对齐。
     private static let recommendedChineseASR = "mlx-community/Qwen3-ASR-0.6B-4bit"
     private static let recommendedNonChineseASR = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
+
+    static func usesNemotron(nonChineseASR: String) -> Bool {
+        let effective = nonChineseASR.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = effective.isEmpty ? recommendedNonChineseASR : effective
+        return model.lowercased().contains("nemotron")
+    }
 
     /// 槽位选择器：下拉框只有 2 个选项 ——
     ///   - 「推荐」（项目作者写死的 ID，跟 whicc.py:QWEN3_MODEL / 默认 nemotron 对齐）

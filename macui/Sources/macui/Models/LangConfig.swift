@@ -48,6 +48,11 @@ final class LangConfig: ObservableObject {
     /// hf-mirror.com 镜像。直连 huggingface.co 缓慢/受限的网络环境
     /// 开这个;海外网络保持关闭(直连更快)。下一次下载即生效。
     @Published var hfMirrorEnabled: Bool = false
+    /// Nemotron 流式右上下文：3=320ms、6=560ms、13=1.12s。
+    @Published var nemotronRightContext: Int = 6
+    @Published var translationPriorityEnabled: Bool = true
+    @Published var probePartialEnabled: Bool = true
+    @Published var nemotronNativeStreamingEnabled: Bool = false
     @Published var hermesHost: String = ""
     /// 用户手填的翻译场景描述，写入 lang_config.json 的 `scene` 键。
     /// translate_stream 热重载后注入 Hy-MT2 prompt；留空则不注入。
@@ -236,6 +241,11 @@ final class LangConfig: ObservableObject {
 
     func setHfMirrorEnabled(_ enabled: Bool) {
         hfMirrorEnabled = enabled
+        save()
+    }
+
+    func setNemotronRightContext(_ value: Int) {
+        nemotronRightContext = [3, 6, 13].contains(value) ? value : 6
         save()
     }
 
@@ -549,6 +559,11 @@ final class LangConfig: ObservableObject {
                 self.assignIfChanged(\.translationEndpoint, ep)
             }
             self.hfMirrorEnabled = (json["hf_mirror_enabled"] as? Bool) ?? false
+            let rightContext = (json["nemotron_right_context"] as? Int) ?? 6
+            self.nemotronRightContext = [3, 6, 13].contains(rightContext) ? rightContext : 6
+            self.translationPriorityEnabled = (json["translation_priority_enabled"] as? Bool) ?? true
+            self.probePartialEnabled = (json["probe_partial_enabled"] as? Bool) ?? true
+            self.nemotronNativeStreamingEnabled = (json["nemotron_native_streaming_enabled"] as? Bool) ?? false
             // 旧配置文件没有 translation_enabled 键,默认为关(纯本地)。
             // 这样老用户升级后行为不会突变。
             self.translationEnabled = (json["translation_enabled"] as? Bool) ?? false
@@ -596,6 +611,11 @@ final class LangConfig: ObservableObject {
             self.translationEndpoint = ep
         }
         self.hfMirrorEnabled = (json["hf_mirror_enabled"] as? Bool) ?? false
+        let rightContext = (json["nemotron_right_context"] as? Int) ?? 6
+        self.nemotronRightContext = [3, 6, 13].contains(rightContext) ? rightContext : 6
+        self.translationPriorityEnabled = (json["translation_priority_enabled"] as? Bool) ?? true
+        self.probePartialEnabled = (json["probe_partial_enabled"] as? Bool) ?? true
+        self.nemotronNativeStreamingEnabled = (json["nemotron_native_streaming_enabled"] as? Bool) ?? false
         self.translationEnabled = (json["translation_enabled"] as? Bool) ?? false
         self.hermesHost = (json["hermes_host"] as? String) ?? ""
         self.sceneText = (json["scene"] as? String) ?? ""
@@ -646,6 +666,10 @@ final class LangConfig: ObservableObject {
         json["translation_fallback_api_key"] = translationFallbackApiKey
         json["translation_endpoint"] = translationEndpoint
         json["hf_mirror_enabled"] = hfMirrorEnabled
+        json["nemotron_right_context"] = nemotronRightContext
+        json["translation_priority_enabled"] = translationPriorityEnabled
+        json["probe_partial_enabled"] = probePartialEnabled
+        json["nemotron_native_streaming_enabled"] = nemotronNativeStreamingEnabled
         json["translation_enabled"] = translationEnabled
         json["hermes_host"] = hermesHost
         json["scene"] = sceneText

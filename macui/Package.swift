@@ -10,5 +10,10 @@ let package = Package(
             name: "whicc-macui",
             path: "Sources/macui"
         ),
+        .testTarget(
+            name: "whicc-macuiTests",
+            dependencies: ["whicc-macui"],
+            path: "Tests/macuiTests"
+        ),
     ]
 )
