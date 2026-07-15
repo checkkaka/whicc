@@ -1,0 +1,11 @@
+{
+  "video_id": "jVbGX7zJHi8",
+  "url": "https://youtu.be/jVbGX7zJHi8?si=0J9efVZbSw73uhYZ",
+  "title": "There’s hope in hard questions",
+  "duration_sec": 90,
+  "reference_vtt": "test_audio/references/jVbGX7zJHi8.en.vtt",
+  "recording_pcm": "test_audio/regression_en_latest.f32le.pcm",
+  "recording_format": "float32le/16000Hz/mono",
+  "audio_offset_sec": null,
+  "notes": "英文人工字幕作为 ASR/断句硬基准；简体中文字幕若下载成功只作翻译辅助参考。"
+}

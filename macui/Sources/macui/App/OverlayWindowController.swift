@@ -172,19 +172,9 @@ final class OverlayWindowController: NSObject {
                 height: max(proposed.height, minSize.height)
             )
         }
-        // When the user clicks the red close button (or macOS routes ⌘W
-        // to windowWillClose on the panel), AppKit fires windowWillClose
-        // on the panel — but NOT applicationWillTerminate. Trigger
-        // NSApp.terminate(nil) explicitly so applicationWillTerminate
-        // fires and runs the full cleanup chain (watcher.stop,
-        // BackendShutdown.terminateLocalBackend). Without this hook
-        // the user-visible effect of ⌘W would be: backend dies but
-        // the overlay process keeps running (and ⌘Q would be needed
-        // to actually exit). Hook here so every exit path terminates
-        // the process, not just ⌘Q.
-        panel.onWillClose = {
-            NSApp.terminate(nil)
-        }
+        // Follow normal macOS window semantics: the red button hides the
+        // overlay window, while Cmd+Q / Quit terminates the app and runs
+        // backend cleanup from applicationWillTerminate.
         return panel
     }
 
@@ -224,11 +214,9 @@ final class OverlayWindowController: NSObject {
     }
 
     private func applyChromeVisibility(isVisible: Bool) {
-        // macOS 26 traffic-light buttons (close / miniaturize / zoom) are
-        // system-level chrome — they must remain clickable at all times
-        // so the user can quit, minimize, or fullscreen the panel even
-        // when the HUD itself is hidden. Only the SwiftUI HUD chrome
-        // (HUDBar + StatusChips) reacts to hover; see `HUDView`.
+        // Only the SwiftUI HUD chrome (HUDBar + StatusChips) reacts to
+        // hover. System traffic-light buttons keep standard macOS
+        // behavior: close hides the overlay, minimize goes to Dock.
     }
 }
 

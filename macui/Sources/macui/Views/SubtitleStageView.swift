@@ -3,10 +3,9 @@ import SwiftUI
 /// Owns the vertical layout of the subtitle region:
 ///
 ///     ┌──────────────────────────────┐
-///     │      history (scrollable)    │  ← optional
-///     │                              │
-///     │     committed caption        │  ← large
-///     │     draft caption (stream)   │  ← smaller
+///     │      history (scrollable)    │  ← optional, capped first
+///     │     committed caption        │  ← large, priority content
+///     │     draft caption (stream)   │  ← smaller, priority content
 ///     └──────────────────────────────┘
 ///
 /// Honors `Palette.historyMinVisible` / `Palette.sourceMinVisible` so
@@ -72,12 +71,18 @@ struct SubtitleStageView: View, Equatable {
         GeometryReader { geo in
             let availableH = geo.size.height
             let contentH = max(0, availableH - hudHeight)
+            let hasDraft = (draftSourceText?.isEmpty == false)
+                || (draftTranslatedText?.isEmpty == false)
             let showHistoryNow = showHistory
                 && !history.isEmpty
-                && contentH >= Palette.historyMinVisible
+                && contentH >= (hasDraft ? 320 : Palette.historyMinVisible)
             let historyMaxH: CGFloat = showHistoryNow
-                ? min(max((contentH - 140) * 1, 40), Palette.historyMaxHeight)
+                ? min(max(contentH - (hasDraft ? 220 : 140), 40),
+                      hasDraft ? 140 : Palette.historyMaxHeight)
                 : 0
+            let subtitleH: CGFloat? = showHistoryNow
+                ? max(0, contentH - historyMaxH)
+                : nil
 
             VStack(spacing: 0) {
                 // HUD plate sits on top of the stage (see ContentView's
@@ -99,48 +104,50 @@ struct SubtitleStageView: View, Equatable {
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
-                subtitleStage(availableH: availableH)
+                subtitleStage
                     .padding(.horizontal, Palette.subtitleHPadding)
+                    .frame(height: subtitleH)
+                    .frame(maxHeight: showHistoryNow ? nil : .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
     }
 
-    @ViewBuilder
-    private func subtitleStage(availableH: CGFloat) -> some View {
-        // contentH = availableH - hudHeight。hideDraft 决策:
+    private var subtitleStage: some View {
+        // GeometryReader 获得 HUD/历史之后的真实剩余高度。hideDraft 决策:
         //   < draftMinVisible → 隐藏 draft(避免刚露 1/4 行的"半截"状态)
         //   ≥ draftMinVisible → 显示 draft + committed,各自 fit-content
         //     (DraftSubtitle 内 lineLimit 截断,SwiftUI VStack 自然堆叠)
         // 之前用 committedHeight upper-bound (~236pt) 减 contentH 算
         // draftHeight,导致 contentH < 236 时 draft 永远不显示 — 已改。
-        let contentH = max(0, availableH - hudHeight)
-        let hideDraft = contentH < Palette.draftMinVisible
-        VStack(spacing: 0) {
-            // 没正式字幕时显示占位字幕——作为"参考信息"卡让用户看到
-            // 当前外观设置 (字体/字号/颜色/阴影) 的实时效果。
-            // 仅当 `showIdlePreview == true` 时显示（用户在 Settings 调
-            // 节外观 5 秒内），平时字幕区干净。
+        GeometryReader { stage in
+            let contentH = max(0, stage.size.height)
+            let hideDraft = contentH < Palette.draftMinVisible
+            let finalTopInset = min(18, max(4, contentH * 0.08))
             let displayedCaption: OverlayCaption? = committed
                 ?? (showIdlePreview ? Self.idlePreviewCaption() : nil)
-            if let cap = displayedCaption {
-                SubtitleCaption(
-                    caption: cap,
-                    accent: accent,
-                    showSource: showSource,
-                    srcFontSize: srcFontSize,
-                    transFontSize: transFontSize,
-                    bilingualLayout: bilingualLayout,
-                    fontChoice: fontChoice,
-                    shadowStrong: shadowStrong,
-                    shadowSoft: shadowSoft,
-                    shadowStrongRadius: shadowStrongRadius,
-                    shadowSoftRadius: shadowSoftRadius
-                )
+            VStack(spacing: 0) {
+                Color.clear.frame(height: finalTopInset)
+                if let cap = displayedCaption {
+                    SubtitleCaption(
+                        caption: cap,
+                        accent: accent,
+                        showSource: showSource,
+                        srcFontSize: srcFontSize,
+                        transFontSize: transFontSize,
+                        bilingualLayout: bilingualLayout,
+                        fontChoice: fontChoice,
+                        shadowStrong: shadowStrong,
+                        shadowSoft: shadowSoft,
+                        shadowStrongRadius: shadowStrongRadius,
+                        shadowSoftRadius: shadowSoftRadius
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .top)
+                    .layoutPriority(1)
                     .id(cap.id)
-            }
-            if !hideDraft {
+                }
+                if !hideDraft {
                 // 不给 draft 固定/最大 frame——让 DraftSubtitle 自己按内容
                 // 算 fit-content 大小（BilingualStack + lineLimit(2/3) 自然
                 // 截断，不会撑爆窗口）。之前两种尝试都有问题：
@@ -151,10 +158,14 @@ struct SubtitleStageView: View, Equatable {
                 //     消失（用户报告：y=1 显示译文时 draft 原文高度变 y=0）
                 // fit-content 是 HIG 推荐方式：subtitles 自己按 lineLimit 算高度，
                 // 父 VStack 自然堆叠不挤压。
-                draftSlot
+                    draftSlot
+                        .padding(.top, displayedCaption == nil ? 0 : 12)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     @ViewBuilder
@@ -168,6 +179,7 @@ struct SubtitleStageView: View, Equatable {
                 translated: draftTranslatedText,
                 stablePrefixLen: draftStablePrefixLen,
                 srcFontSize: srcFontSize,
+                transFontSize: transFontSize,
                 bilingualLayout: bilingualLayout,
                 showSource: showSource,
                 accent: accent,

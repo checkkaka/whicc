@@ -11,6 +11,7 @@
 """
 
 import json
+import hashlib
 import os
 import re
 import time
@@ -428,7 +429,9 @@ _CONTEXT_ECHO_PATTERNS: list[str] = []
 # prompt 标签泄漏 — 当前为空。理由同上。
 # 原列表 (14 条 "待翻译文本" "source text" "只输出翻译" 等) 是 vLLM 0.x
 # 早期版本的过度防御。当前 prompt 已经显式说 "只输出翻译结果"。
-_PROMPT_LABEL_LEAKS: list[str] = []
+# `PROMPT_LEAK` 是回归测试使用的显式哨兵；真实 prompt 标签可在出现
+# 可复现泄漏证据后追加，避免宽泛关键词误删正常译文。
+_PROMPT_LABEL_LEAKS: list[str] = ["PROMPT_LEAK"]
 
 
 def _strip_prompt_leak(text: str) -> tuple[str, bool]:
@@ -579,10 +582,6 @@ def postprocess_translation(text: str) -> tuple[str, dict]:
 CONTEXT_MIN_WORDS = 5
 CONTEXT_MIN_ZH_CHARS = 6
 
-# 上一次翻译结果，用于回声检测
-_last_translation: str = ""
-
-
 def should_use_context(source_text: str) -> bool:
     """判断是否启用上下文。中文按字符数，英文按词数。"""
     if not source_text or not source_text.strip():
@@ -636,7 +635,13 @@ class VLLMBackend:
                 "调用方应从 lang_config.json:translation_url / --vllm-url 显式传入"
             )
         self._connect_timeout = connect_timeout
+        self._read_timeout = 90.0
         self._client = None  # 懒建的 httpx.Client(_http_client)
+        self._stream_lock = __import__("threading").Lock()
+        self._active_stream_response = None
+        self.last_finish_reason = ""
+        self.last_request_signature = ""
+        self.last_request_start_mono_ns = 0
         # per-URL API key — 非空时所有请求(探活 + 生成)带
         # `Authorization: Bearer` 头。key 跟 candidates 同格式化。
         self._api_key_per_url: dict[str, str] = {
@@ -701,7 +706,10 @@ class VLLMBackend:
             proxy = proxies.get("https") or proxies.get("http")
             self._client = httpx.Client(
                 proxy=proxy,
-                timeout=httpx.Timeout(connect=5.0, read=90.0,
+                # 系统代理已由 getproxies() 显式传入；禁止 httpx 再解析
+                # NO_PROXY。macOS 的 `::1/128` 会被 httpx 0.28 当坏端口。
+                trust_env=False,
+                timeout=httpx.Timeout(connect=5.0, read=self._read_timeout,
                                       write=15.0, pool=10.0),
                 follow_redirects=True,
             )
@@ -762,6 +770,29 @@ class VLLMBackend:
         if self._active_model_id:
             body["model"] = self._active_model_id
         return path, body
+
+    def _signature_for_request(self, path: str, body: dict) -> str:
+        """规范化实际请求；stream 仅是传输方式，不影响译文复用语义。"""
+        normalized_body = dict(body)
+        normalized_body.pop("stream", None)
+        payload = {
+            "endpoint": self._active_endpoint,
+            "url": f"{self.base_url}{path}",
+            "model": self._active_model_id,
+            "body": normalized_body,
+        }
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def request_signature(self, messages: list[dict], temperature: float,
+                          top_p: float, top_k: int,
+                          repetition_penalty: float,
+                          max_new_tokens: int) -> str:
+        path, body = self._build_request(
+            messages, temperature, top_p, top_k,
+            repetition_penalty, max_new_tokens, stream=False)
+        return self._signature_for_request(path, body)
 
     def _flip_endpoint_if_auto(self, http_status: int) -> bool:
         """auto 模式下收到 404/405(站点没实现当前端点)→ 切另一个端点。
@@ -903,33 +934,53 @@ class VLLMBackend:
     def generate(self, messages: list[dict], temperature: float = 0.7,
                  top_p: float = 0.6, top_k: int = 20,
                  repetition_penalty: float = 1.05,
-                 max_new_tokens: int = 80) -> str:
+                 max_new_tokens: int = 80,
+                 should_cancel: Callable[[], bool] | None = None,
+                 on_request_start: Callable[[int], None] | None = None) -> str:
         """非流式生成。失败时自动重选候选 URL (M2: 远端中途 OOM
         重启时 session 不会翻车);auto 端点模式下 404/405 会先切
         另一个端点重试(站点只实现 chat/responses 其一)。
         """
         import httpx
+        self.last_finish_reason = ""
         # 3 次机会: 端点自适应一次 + URL 重选一次 + 最终尝试
         for attempt in range(3):
             try:
+                if should_cancel and should_cancel():
+                    raise RuntimeError("translation cancelled before request")
                 # 未配置 model_id (空串) → 不在请求体里塞 model 字段,
                 # 让 vLLM 服务端选默认 (LM Studio/vLLM 都有"first loaded
                 # model"兜底)。硬塞 "" 会让 vLLM 返回 400 "model not found"。
                 path, body = self._build_request(
                     messages, temperature, top_p, top_k,
                     repetition_penalty, max_new_tokens, stream=False)
-                resp = self._http_client().post(
+                self.last_request_signature = self._signature_for_request(path, body)
+                client = self._http_client()
+                if should_cancel and should_cancel():
+                    raise RuntimeError("translation cancelled before request")
+                self.last_request_start_mono_ns = time.monotonic_ns()
+                if on_request_start:
+                    on_request_start(self.last_request_start_mono_ns)
+                resp = client.post(
                     f"{self.base_url}{path}",
                     content=json.dumps(body).encode(),
                     headers=self._headers(),
                 )
                 resp.raise_for_status()
+                if should_cancel and should_cancel():
+                    raise RuntimeError("translation cancelled after response")
                 result = resp.json()
                 # 检查服务端返回的 error 字段(OOM / prompt 过长)
                 if "error" in result and result["error"]:
                     raise RuntimeError(f"翻译服务错误: {result['error']}")
                 if self._active_endpoint == "responses":
+                    self.last_finish_reason = str(
+                        result.get("status")
+                        or (result.get("incomplete_details") or {}).get("reason", "")
+                    )
                     return self._parse_responses_output(result).strip()
+                self.last_finish_reason = str(
+                    result["choices"][0].get("finish_reason") or "")
                 return result["choices"][0]["message"]["content"].strip()
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
@@ -943,6 +994,8 @@ class VLLMBackend:
                 self._active_model_id = self._model_per_url.get(
                     self.base_url, self.model_id)
             except (httpx.HTTPError, RuntimeError, ConnectionError) as e:
+                if should_cancel and should_cancel():
+                    raise RuntimeError("translation cancelled") from e
                 if attempt == 2:
                     raise
                 print(f"[translator] {self.base_url} 失败 ({e}),重选候选...",
@@ -957,7 +1010,10 @@ class VLLMBackend:
                            temperature: float = 0.7,
                            top_p: float = 0.6, top_k: int = 20,
                            repetition_penalty: float = 1.05,
-                           max_new_tokens: int = 80) -> str:
+                           max_new_tokens: int = 80,
+                           should_cancel: Callable[[], bool] | None = None,
+                           on_request_start: Callable[[int], None] | None = None
+                           ) -> str:
         """Generate with SSE streaming from vLLM.
 
         on_token receives (piece, full_so_far) per token. The first
@@ -966,14 +1022,24 @@ class VLLMBackend:
         that only want the running total can ignore the first
         argument with `lambda piece, full: handler(full)`.
         """
+        self.last_finish_reason = ""
         # auto 端点模式: 404/405 时切另一个端点重试一次。
         # httpx.stream 复用 _http_client 的 keep-alive 连接 — SSE 首 token
         # 延迟里省掉整段代理 CONNECT + TLS 握手。
         for attempt in range(2):
+            if should_cancel and should_cancel():
+                raise RuntimeError("streaming cancelled before request")
             path, body = self._build_request(
                 messages, temperature, top_p, top_k,
                 repetition_penalty, max_new_tokens, stream=True)
-            with self._http_client().stream(
+            self.last_request_signature = self._signature_for_request(path, body)
+            client = self._http_client()
+            if should_cancel and should_cancel():
+                raise RuntimeError("streaming cancelled before request")
+            self.last_request_start_mono_ns = time.monotonic_ns()
+            if on_request_start:
+                on_request_start(self.last_request_start_mono_ns)
+            with client.stream(
                     "POST",
                     f"{self.base_url}{path}",
                     content=json.dumps(body).encode(),
@@ -984,19 +1050,34 @@ class VLLMBackend:
                         continue
                     raise RuntimeError(
                         f"generate_streaming: HTTP {resp.status_code}")
-                return self._consume_sse(resp, on_token)
+                with self._stream_lock:
+                    self._active_stream_response = resp
+                try:
+                    if should_cancel and should_cancel():
+                        raise RuntimeError("streaming cancelled after response")
+                    return self._consume_sse(resp, on_token, should_cancel)
+                finally:
+                    with self._stream_lock:
+                        self._active_stream_response = None
         raise RuntimeError("generate_streaming: 无可用端点")  # 防御
 
-    def _consume_sse(self, resp, on_token) -> str:
+    def _consume_sse(self, resp, on_token,
+                     should_cancel: Callable[[], bool] | None = None) -> str:
         """消费 SSE 流,逐 token 回调。chat 与 responses 两种事件格式。"""
         full = ""
         is_responses = self._active_endpoint == "responses"
+        terminal_seen = False
         for raw_line in resp.iter_lines():
+            if should_cancel and should_cancel():
+                raise RuntimeError("streaming cancelled")
             line = raw_line.strip()
             if not line or not line.startswith("data: "):
                 continue  # 跳过空行和 `event:` 行(Responses SSE 会发)
             data = line[len("data: "):]
             if data == "[DONE]":
+                terminal_seen = True
+                if not self.last_finish_reason:
+                    self.last_finish_reason = "done"
                 break
             try:
                 chunk = json.loads(data)
@@ -1018,18 +1099,47 @@ class VLLMBackend:
                             full += piece
                             on_token(piece, full)
                     elif ctype == "response.completed":
+                        self.last_finish_reason = "completed"
+                        terminal_seen = True
+                        break
+                    elif ctype == "response.incomplete":
+                        self.last_finish_reason = str(
+                            (chunk.get("response") or {})
+                            .get("incomplete_details", {}).get("reason")
+                            or "incomplete")
+                        terminal_seen = True
                         break
                     elif ctype in ("response.error", "error", "response.failed"):
                         raise RuntimeError(f"Responses API 错误: {chunk}")
                     continue
                 delta = chunk["choices"][0].get("delta", {})
+                reason = chunk["choices"][0].get("finish_reason")
+                if reason:
+                    self.last_finish_reason = str(reason)
+                    terminal_seen = True
                 piece = delta.get("content", "")
                 if piece:
                     full += piece
                     on_token(piece, full)  # (piece, cumulative)
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
+        if not terminal_seen:
+            raise RuntimeError(
+                "generate_streaming: SSE ended without terminal event")
         return full.strip()
+
+    def cancel_streaming(self) -> None:
+        """废弃 partial 连接；同时中断尚未收到响应头和已开始的 SSE。"""
+        with self._stream_lock:
+            response = self._active_stream_response
+            client = self._client
+            self._client = None
+        for handle in (client, response):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
 
 # ── 统一 Translator 接口 ────────────────────────────────────────────────────────
@@ -1055,12 +1165,67 @@ class HyMT2Translator:
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
         self.max_new_tokens = max_new_tokens
+        self._last_translation = ""
+        self._request_start_mono_ns = 0
+        self._init_kwargs = {
+            "model_id": model_id,
+            "vllm_url": list(vllm_url) if isinstance(vllm_url, list) else vllm_url,
+            "model_map": dict(model_map or {}),
+            "glossary_path": glossary_path,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+            "max_new_tokens": max_new_tokens,
+            "api_key_map": dict(api_key_map or {}),
+            "endpoint": endpoint,
+        }
         # vllm_url / model_id / model_map / api_key_map / endpoint
         # 全部透传给 VLLMBackend
         self._backend = VLLMBackend(vllm_url, model_id=model_id,
                                     model_map=model_map,
                                     api_key_map=api_key_map,
                                     endpoint=endpoint)
+
+    def fork(self):
+        """创建独立 HTTP client 的同参数翻译器，供 final worker 使用。"""
+        return type(self)(**self._init_kwargs)
+
+    def cancel_streaming(self) -> None:
+        self._backend.cancel_streaming()
+
+    def set_stream_read_timeout(self, seconds: float) -> None:
+        """只供 partial worker 缩短无数据等待；final fork 保留默认超时。"""
+        self._backend._read_timeout = seconds
+        self._backend.cancel_streaming()  # 下次请求按新 timeout 重建 client
+
+    def request_signature(self, source_text: str,
+                          target_lang: str = "Simplified Chinese") -> str:
+        """按实际请求 endpoint/URL/model/body 计算可复用签名。"""
+        hits = detect_glossary_hits(source_text, self.glossary, target_lang)
+        messages = build_messages(source_text, glossary_hits=hits,
+                                  context=None, target_lang=target_lang)
+        return self._backend.request_signature(
+            messages, self.temperature, self.top_p, self.top_k,
+            self.repetition_penalty, self.max_new_tokens)
+
+    @property
+    def last_request_signature(self) -> str:
+        """最近一次实际发出的请求签名（包含重试或去上下文重发）。"""
+        return self._backend.last_request_signature
+
+    @property
+    def finish_reason(self) -> str:
+        return self._backend.last_finish_reason
+
+    @property
+    def request_start_mono_ns(self) -> int:
+        """最近一次高层翻译调用中，首个真实 HTTP 请求开始时刻。"""
+        return self._request_start_mono_ns
+
+    def _record_request_start(self, stamp: int) -> None:
+        if not self._request_start_mono_ns:
+            self._request_start_mono_ns = stamp
 
     def _generate(self, messages: list[dict]) -> tuple[str, float]:
         """底层推理，返回 (raw_output, elapsed_ms)。"""
@@ -1072,13 +1237,16 @@ class HyMT2Translator:
             top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
             max_new_tokens=self.max_new_tokens,
+            on_request_start=self._record_request_start,
         )
         elapsed_ms = (time.monotonic() - t0) * 1000
         raw, _ = _strip_context_echo(raw.strip())
         return raw, elapsed_ms
 
     def _generate_streaming(self, messages: list[dict],
-                            on_token: Callable[[str, str], None]) -> tuple[str, float]:
+                            on_token: Callable[[str, str], None],
+                            should_cancel: Callable[[], bool] | None = None
+                            ) -> tuple[str, float]:
         """流式推理，on_token(piece, full_so_far) 随每个 token 触发。
 
         第一参数是 SSE / TextStreamer 给的 token piece，第二参数
@@ -1095,6 +1263,8 @@ class HyMT2Translator:
             top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
             max_new_tokens=self.max_new_tokens,
+            should_cancel=should_cancel,
+            on_request_start=self._record_request_start,
         )
         elapsed_ms = (time.monotonic() - t0) * 1000
         raw, _ = _strip_context_echo(raw.strip())
@@ -1105,7 +1275,9 @@ class HyMT2Translator:
                       is_delta: bool = False,
                       prev_source_tail: str = "",
                       prev_target_tail: str = "",
-                      target_lang: str = "Simplified Chinese") -> tuple[str, float, bool]:
+                      target_lang: str = "Simplified Chinese",
+                      should_cancel: Callable[[], bool] | None = None
+                      ) -> tuple[str, float, bool]:
         """如果输出异常，重试一次。返回 (result, elapsed_ms, retried)。"""
         if not _is_bad_output(raw, target_lang):
             return raw, elapsed_ms, False
@@ -1135,6 +1307,8 @@ class HyMT2Translator:
                 extra_instruction=retry_instruction,
             )
 
+        if should_cancel and should_cancel():
+            raise RuntimeError("streaming cancelled before retry")
         t0 = time.monotonic()
         raw2 = self._backend.generate(
             retry_messages,
@@ -1143,6 +1317,8 @@ class HyMT2Translator:
             top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
             max_new_tokens=self.max_new_tokens,
+            should_cancel=should_cancel,
+            on_request_start=self._record_request_start,
         )
         retry_ms = (time.monotonic() - t0) * 1000
         raw2, _ = _strip_context_echo(raw2.strip())
@@ -1154,7 +1330,7 @@ class HyMT2Translator:
                   context: list[dict] | list[str] | None = None,
                   target_lang: str = "Simplified Chinese") -> tuple[str, float]:
         """全量翻译，返回 (译文, 耗时ms)。"""
-        global _last_translation
+        self._request_start_mono_ns = 0
         hits = detect_glossary_hits(source_text, self.glossary, target_lang)
         effective_ctx = context if should_use_context(source_text) else None
         messages = build_messages(source_text, glossary_hits=hits, context=effective_ctx, target_lang=target_lang)
@@ -1162,13 +1338,13 @@ class HyMT2Translator:
         initial_bad = _is_bad_output(raw, target_lang)
         raw, elapsed_ms, retried = self._retry_if_bad(raw, source_text, hits, elapsed_ms, target_lang=target_lang)
         result, post_meta = postprocess_translation(raw.strip())
-        if effective_ctx and _looks_like_context_echo(result, _last_translation):
+        if effective_ctx and _looks_like_context_echo(result, self._last_translation):
             messages_nc = build_messages(source_text, glossary_hits=hits, context=None, target_lang=target_lang)
             raw2, elapsed2 = self._generate(messages_nc)
             raw2, elapsed2, _ = self._retry_if_bad(raw2, source_text, hits, elapsed2, target_lang=target_lang)
             result, post_meta = postprocess_translation(raw2.strip())
             elapsed_ms += elapsed2
-        _last_translation = result
+        self._last_translation = result
         print(f"[translate] {detect_language(source_text)}→{target_lang} "
               f"bad={initial_bad} retry={retried} "
               f"leak={post_meta['prompt_leak_removed']} "
@@ -1180,7 +1356,9 @@ class HyMT2Translator:
     def translate_streaming(self, source_text: str,
                             on_token: Callable[[str, str], None],
                             context: list[dict] | list[str] | None = None,
-                            target_lang: str = "Simplified Chinese") -> tuple[str, float]:
+                            target_lang: str = "Simplified Chinese",
+                            should_cancel: Callable[[], bool] | None = None
+                            ) -> tuple[str, float]:
         """流式全量翻译。
 
         on_token 接收 (piece, full_so_far)：
@@ -1188,13 +1366,18 @@ class HyMT2Translator:
         - full_so_far: 累计全文（包含本 piece）
         调用方如只需累计全文可写 lambda piece, full: handler(full)。
         """
-        global _last_translation
+        self._request_start_mono_ns = 0
         hits = detect_glossary_hits(source_text, self.glossary, target_lang)
         effective_ctx = context if should_use_context(source_text) else None
         messages = build_messages(source_text, glossary_hits=hits, context=effective_ctx, target_lang=target_lang)
-        raw, elapsed_ms = self._generate_streaming(messages, on_token)
+        raw, elapsed_ms = self._generate_streaming(
+            messages, on_token, should_cancel=should_cancel)
+        if should_cancel and should_cancel():
+            raise RuntimeError("streaming cancelled before validation")
         initial_bad = _is_bad_output(raw, target_lang)
-        raw, elapsed_ms, retried = self._retry_if_bad(raw, source_text, hits, elapsed_ms, target_lang=target_lang)
+        raw, elapsed_ms, retried = self._retry_if_bad(
+            raw, source_text, hits, elapsed_ms, target_lang=target_lang,
+            should_cancel=should_cancel)
         if retried:
             # on_token 是 (piece, full) 双参回调 — 之前这里单参调用,
             # 坏输出触发重试时直接 TypeError 崩掉翻译线程。
@@ -1202,17 +1385,20 @@ class HyMT2Translator:
             _retry_text = postprocess_translation(raw.strip())[0]
             on_token(_retry_text, _retry_text)
         result, post_meta = postprocess_translation(raw.strip())
-        if effective_ctx and _looks_like_context_echo(result, _last_translation):
+        if effective_ctx and _looks_like_context_echo(result, self._last_translation):
             messages_nc = build_messages(source_text, glossary_hits=hits, context=None, target_lang=target_lang)
-            raw2, elapsed2 = self._generate_streaming(messages_nc, on_token)
-            raw2, elapsed2, retried2 = self._retry_if_bad(raw2, source_text, hits, elapsed2, target_lang=target_lang)
+            raw2, elapsed2 = self._generate_streaming(
+                messages_nc, on_token, should_cancel=should_cancel)
+            raw2, elapsed2, retried2 = self._retry_if_bad(
+                raw2, source_text, hits, elapsed2, target_lang=target_lang,
+                should_cancel=should_cancel)
             if retried2:
                 # 同上:双参回调,单参调用是必崩 bug
                 _retry_text2 = postprocess_translation(raw2.strip())[0]
                 on_token(_retry_text2, _retry_text2)
             result, post_meta = postprocess_translation(raw2.strip())
             elapsed_ms += elapsed2
-        _last_translation = result
+        self._last_translation = result
         print(f"[stream] {detect_language(source_text)}→{target_lang} "
               f"bad={initial_bad} retry={retried} "
               f"leak={post_meta['prompt_leak_removed']} "
@@ -1229,6 +1415,7 @@ class HyMT2Translator:
 
         返回 (译文, 耗时ms, meta_dict)。
         """
+        self._request_start_mono_ns = 0
         hits = detect_glossary_hits(delta_source_text, self.glossary, target_lang)
         messages = build_delta_messages(
             delta_source_text,
@@ -1274,6 +1461,7 @@ class HyMT2Translator:
         meta 字段多了 is_streaming=True 标记，供调用方区分流式 vs
         整段 partial 事件。
         """
+        self._request_start_mono_ns = 0
         hits = detect_glossary_hits(delta_source_text, self.glossary, target_lang)
         messages = build_delta_messages(
             delta_source_text,

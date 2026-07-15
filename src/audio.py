@@ -27,12 +27,23 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 
 from config import SAMPLE_RATE, SYSTEM_AUDIO_STALL_SEC
 
 SENTINEL = None  # putting this on the queue signals the audio stream has ended
+
+
+@dataclass(frozen=True)
+class CapturedAudio:
+    """一块带采集时钟的音频；dropped_before 表示其前方发生过丢帧。"""
+
+    samples: np.ndarray
+    capture_end_mono_ns: int
+    sequence: int
+    dropped_before: bool = False
 
 
 class AudioteeWaitingError(RuntimeError):
@@ -63,6 +74,9 @@ class AudioSource(ABC):
         # maxsize caps memory; 队列满了丢最旧的 live frame,不阻塞采集侧
         self.queue: queue.Queue = queue.Queue(maxsize=200)
         self._stop = threading.Event()
+        self._sequence = 0
+        self._sentinel_lock = threading.Lock()
+        self._sentinel_emitted = False
 
     @abstractmethod
     def start(self) -> None: ...
@@ -70,18 +84,42 @@ class AudioSource(ABC):
     @abstractmethod
     def stop(self) -> None: ...
 
+    def _begin_stream(self) -> None:
+        """开始/重启采集；重置 stop 与本轮唯一 SENTINEL 状态。"""
+        self._stop.clear()
+        with self._sentinel_lock:
+            self._sentinel_emitted = False
+
     def _offer(self, samples: np.ndarray) -> None:
-        """Enqueue a live frame: 队列满了丢最旧,不阻塞采集侧。"""
+        """Enqueue a live frame；队列满时标记缺口，不再静默丢帧。"""
+        # stop 可能发生在 pump 的 read 与 _offer 之间；SENTINEL 必须严格
+        # 位于最后一块 PCM 之后，因此 stop 置位后拒绝任何迟到帧。
+        if self._stop.is_set():
+            return
+        sequence = self._sequence
+        self._sequence += 1
+        capture_end_mono_ns = time.monotonic_ns()
+        dropped_before = False
         while True:
             try:
-                self.queue.put_nowait(samples)
+                self.queue.put_nowait(CapturedAudio(
+                    samples=samples,
+                    capture_end_mono_ns=capture_end_mono_ns,
+                    sequence=sequence,
+                    dropped_before=dropped_before,
+                ))
                 return
             except queue.Full:
                 with contextlib.suppress(queue.Empty):
                     self.queue.get_nowait()
+                    dropped_before = True
 
     def _put_sentinel(self) -> None:
-        """Enqueue SENTINEL, 队列满时丢最旧腾位。"""
+        """每轮只入队一个 SENTINEL；队列满时丢最旧腾位。"""
+        with self._sentinel_lock:
+            if self._sentinel_emitted:
+                return
+            self._sentinel_emitted = True
         while True:
             try:
                 self.queue.put_nowait(SENTINEL)
@@ -113,6 +151,8 @@ class MicSource(AudioSource):
                 "macOS 上 PortAudio 跟 sounddevice 一起装:"
                 " brew install portaudio && pip install sounddevice"
             )
+
+        self._begin_stream()
 
         def callback(indata, frames, time_info, status):  # noqa: ANN001
             if self._stop.is_set():
@@ -240,7 +280,8 @@ class SystemAudioSource(AudioSource):
                 f"audiotee 不存在: {self.audiotee_path}\n"
                 "运行: ./bin/build_audiotee.sh 编译并放在 ./bin/audiotee"
             )
-        self._stop.clear()
+        self._begin_stream()
+        self.failed = False
         if self.bundle_id:
             # 调用 process_resolver：按 Bundle ID 解析当前可捕获 PID。
             # 不在 start() 里无限等待——否则会堵住 whicc 模型加载。
@@ -430,20 +471,21 @@ class SystemAudioSource(AudioSource):
         """
         if self._reconfig_unsupported:
             return False
-        proc = SystemAudioSource._shared_proc
-        if proc is None or proc.poll() is not None or proc.stdin is None:
-            return False
         payload = json.dumps(
             {"cmd": "set_include_processes", "pids": sorted(pids)}
         ) + "\n"
         self._reconfig_event.clear()
         self._reconfig_status = None
-        try:
-            proc.stdin.write(payload.encode("utf-8"))
-            proc.stdin.flush()
-        except OSError as e:
-            print(f"[AudioTee] reconfigure write failed: {e}", flush=True)
-            return False
+        with SystemAudioSource._shared_lock:
+            proc = SystemAudioSource._shared_proc
+            if proc is None or proc.poll() is not None or proc.stdin is None:
+                return False
+            try:
+                proc.stdin.write(payload.encode("utf-8"))
+                proc.stdin.flush()
+            except (OSError, ValueError) as e:
+                print(f"[AudioTee] reconfigure write failed: {e}", flush=True)
+                return False
         if not self._reconfig_event.wait(self._RECONFIG_ACK_SEC):
             # 无 ack = 旧二进制(不读 stdin);记住并永久回退 respawn 路径。
             self._reconfig_unsupported = True
@@ -751,9 +793,9 @@ class SystemAudioSource(AudioSource):
         # 注意:不杀 audiotee 子进程(全部系统音频模式)!只让 _pump 退出读循环。
         # application 模式会在下次不同 filter 启动时强制重建。
         self._stop.set()
-        self._put_sentinel()
-        # 等 supervise 线程退出,避免旧 _pump 还在读 pipe 时 start
-        # 创建新的 _pump 同时读同一个 pipe (read-once 竞争)。
+        # 先等 supervise/_pump 完全退出，再发布唯一 SENTINEL。旧顺序会让
+        # mid-read 的 pump 在 SENTINEL 后追加 PCM；消费端遇 sentinel 即停，
+        # 这块尾音会永久丢失。
         if self._supervisor_thread is not None:
             self._supervisor_thread.join(timeout=2.0)
             if self._supervisor_thread.is_alive():
@@ -764,6 +806,9 @@ class SystemAudioSource(AudioSource):
             if self._pid_watch_thread.is_alive():
                 print("[audio] warn: pid-watch thread still alive after stop()",
                       flush=True)
+        # _supervise 正常退出也会调用；_put_sentinel 幂等，确保没有启动过
+        # supervisor 的失败路径同样得到一个可靠流边界。
+        self._put_sentinel()
         print(f"[audio] SystemAudioSource stopped (audiotee kept alive)",
               flush=True)
 

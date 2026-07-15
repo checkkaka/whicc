@@ -164,6 +164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 内嵌 Python 不得改写已签名 .app 内的 __pycache__，否则资源封印失效。
+        setenv("PYTHONDONTWRITEBYTECODE", "1", 1)
         do {
             // 打包模式 (.app bundle 双击启动) 下没有 CLI 参数 — 给个合理的默认
             // 让 macui 知道订阅哪个 JSONL。开发模式仍要求显式传参。
@@ -335,16 +337,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openSettings()
     }
 
-    /// ⌘W handler — close the key window.
-    /// Subtitle panel → terminate app (same as ⌘Q / red button).
-    /// Settings window → close just the window.
+    /// ⌘W handler — close/hide the key window.
+    /// Subtitle panel follows normal macOS window behavior: hide the
+    /// overlay, keep ASR/translation running. Cmd+Q is the explicit app
+    /// quit path that tears down the backend.
     @MainActor
     @objc func closeWindowFromMenu() {
         if let panel = windowController?.panel, panel.isKeyWindow {
-            NSApp.terminate(nil)
+            panel.close()
         } else if let win = settingsWindow, win.isKeyWindow {
             win.close()
         }
+    }
+
+    @MainActor
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        if !flag, let panel = windowController?.panel {
+            panel.makeKeyAndOrderFront(nil)
+            return true
+        }
+        return true
     }
 
     @MainActor

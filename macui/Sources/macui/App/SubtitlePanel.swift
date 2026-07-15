@@ -11,21 +11,16 @@ import AppKit
 /// logic, which is what was causing the y-axis jump with the old
 /// `didResizeNotification` approach).
 ///
-/// `onWillClose` lets the controller hook the panel's close button
-/// so it can shut down the local backend (whicc.py / translate_stream /
-/// glossary_refresher / whicc-audio) in addition to just hiding the
-/// panel. Without this hook, clicking the red close button would
-/// only hide the panel — `applicationWillTerminate` doesn't fire
-/// when the user closes the only window via the close button.
+/// The red close button follows standard macOS semantics: it hides the
+/// overlay window. Backend cleanup belongs to the explicit app quit path
+/// (`Cmd+Q` / Quit menu), where `applicationWillTerminate` fires.
 final class SubtitlePanel: NSPanel, NSWindowDelegate {
     /// Closure invoked on every user-driven resize *before* AppKit
     /// applies the new size. Return a size to clamp it; return
     /// `proposedFrameSize` unchanged to let the resize go through.
     var resizeClamp: ((_ proposedFrameSize: NSSize) -> NSSize)?
 
-    /// Closure invoked right before the panel is closed (e.g. user
-    /// clicked the red close button). Used to terminate the local
-    /// backend in addition to the SwiftUI process.
+    /// Optional hook invoked right before the panel is closed.
     var onWillClose: (() -> Void)?
 
     override var canBecomeKey: Bool { true }
