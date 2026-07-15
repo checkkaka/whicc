@@ -7,7 +7,7 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4%2FM5-black.svg)](https://support.apple.com/en-us/116943)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://www.swift.org/)
-[![CI](https://github.com/nbzz/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[![CI](https://github.com/checkkaka/whicc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [中文 README](README.zh.md) · [Docs](DEVELOPMENT.md)
 
 <!-- Visual assets (file description in docs/screenshots/README.md):
@@ -49,11 +49,12 @@ If you're studying abroad or in a foreign-language class, switch to microphone m
 ## ✨ Core features
 
 - **🛡️ Always-on translation safety net** — The subtitle is always on screen, never out of your mind. Not aiming for perfection — aiming for *always there*.
-- **🖥️ Local ASR, end-to-end** — Nemotron-3.5-ASR (non-Chinese) + Qwen3-ASR (Chinese) running on Apple Silicon via MLX. **Audio never leaves your machine**, no cloud transcription service required.
+- **🖥️ Local streaming ASR** — Nemotron-3.5-ASR (non-Chinese) + Qwen3-ASR (Chinese) running on Apple Silicon via MLX. **Audio never leaves your machine**, no cloud transcription service required.
+- **🎧 Three audio sources** — Capture all system audio, the microphone, or one selected app by Bundle ID. App mode waits when the target quits and resumes when it relaunches.
 - **🌐 Most languages covered** — The translation backend uses Tencent Hy-MT2, supporting dozens of languages in any combination (Chinese, English, Japanese, German, French, Spanish, Russian, Korean, Arabic, Portuguese, Italian, and more).
 - **🔌 You bring the translation model** — whicc doesn't ship a translation model. You install [LM Studio](https://lmstudio.ai/) and load a translation model (on this Mac, a Windows PC on your home network, or any machine with network access). The bigger the model, the better the translation.
-- **🪟 SwiftUI floating subtitle** — A floating panel that auto-hides when not focused and switches target/source layout on the fly. Liquid Glass on macOS 26, frosted material fallback on macOS 15.
-- **🤖 Self-learning glossary** — jieba keyword extraction + scene detection + Hermes Agent terminology search. Terms accumulate in `glossary.json` and apply automatically next session.
+- **🪟 Stable live subtitles** — Final captions stay readable above continuously updated source/translation drafts. Text wraps to the current window width, with history yielding first in compact layouts.
+- **🤖 Editable, self-learning glossary** — Add or edit terms in Settings, while jieba + Hermes can keep learning new ones. Changes are stored in Application Support and hot-reloaded by the translator.
 - **📈 It gets better with the models** — Upgrade either the ASR or the translation model and whicc's quality follows.
 
 ---
@@ -96,7 +97,8 @@ On first launch the Settings panel will open automatically (or press `⌘,` or c
 1. **Download ASR models** — HuggingFace downloads automatically; needs a working network
 2. **Set up the translation service** — Install [LM Studio](https://lmstudio.ai/) on this Mac or any machine on your LAN, load a translation model (`tencent/Hy-MT2-1.8B-GGUF` or larger), and start the OpenAI-compatible server
 3. **Fill in the translation service URL** — e.g. `http://192.168.1.10:1234` (use `http://localhost:1234` if LM Studio is on the same Mac); fill in the actual model ID LM Studio loaded
-4. **Start watching** — Open any foreign-language video or live stream, subtitles overlay automatically
+4. **Choose an audio source** — Use all system audio, the microphone, or select one running app
+5. **Start watching** — Open any foreign-language video or live stream, subtitles overlay automatically
 
 ### Developers (running from source)
 
@@ -107,11 +109,11 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) — covers CLI flags, project structure, co
 ## 🏗️ Architecture
 
 ```
-System audio / microphone (ScreenCaptureKit / mic)
+System audio / microphone / selected app (AudioTee / mic)
         ↓  16kHz PCM chunks
    whicc.py (ASR)                    ← Local Apple Silicon MLX
    ├─ Qwen3-ASR-0.6B  (Chinese)
-   └─ Nemotron-3.5-ASR (English, two-pass correction)
+   └─ Nemotron-3.5-ASR (native cache-aware streaming + quality fallback)
         ↓  /tmp/whicc-out/events.jsonl        (partial + final subtitle events)
    translate_stream.py               ← LM Studio / vLLM HTTP
         ↓  /tmp/whicc-out/translation_events.jsonl
@@ -135,15 +137,29 @@ For a fuller architecture diagram, the packaging-mode process tree, and the Back
 | ASR | Qwen3-ASR-0.6B | Chinese + multiple dialects |
 | Translation | Tencent Hy-MT2 | **33 languages, any-to-any** (zh, en, ja, de, fr, es, ru, ko, ar, pt, it, nl, vi, th, id, …) |
 
-Default startup uses Nemotron. Switches to Qwen3 automatically when CJK character density crosses 30%.
+Default startup uses Nemotron and switches between Nemotron and Qwen3 automatically after stable language observations.
+
+### Audio source
+
+Settings offers **All system audio**, **Microphone**, and **Selected app**. Selected-app mode stores the Bundle ID rather than a temporary PID, follows the app's helper processes, and waits for the same app to relaunch instead of silently switching sources. System and selected-app capture require macOS **Screen & System Audio Recording** permission.
+
+### Nemotron streaming latency
+
+Nemotron uses persistent cache-aware streaming by default. Settings exposes three trained right-context profiles:
+
+- `[56,3]` — 320ms, default low-latency profile
+- `[56,6]` — 560ms, balanced profile
+- `[56,13]` — 1.12s, quality profile and batch fallback
+
+Changing the profile restarts the ASR backend. If native streaming fails, the current final caption falls back to `[56,13]` batch recognition without discarding uncommitted audio.
 
 ---
 
 ## ⚙️ Translation configuration
 
-Translation is **off** by default. In the macui Settings panel (gear icon):
+The packaged app enables the translation pipeline on first launch, but translated captions still require a configured OpenAI-compatible service. In the macui Settings panel (gear icon):
 
-1. **Service configuration → Enable translation** — turn on
+1. **Service configuration** — keep external translation enabled, or disable it when you only need local ASR drafts
 2. **Main URL** — fill in your LM Studio address (e.g. `http://192.168.1.10:1234`)
 3. **Fallback URL** — fill in a local fallback (e.g. `http://localhost:1234`)
 4. **Model name** — fill in the actual model ID LM Studio loaded
@@ -176,6 +192,9 @@ Fill in a scene description in Settings (e.g. `AI interview` / `NBA Finals`) to 
 
 - **Position**: Top-center floating
 - **Auto-hide**: `opacity(0)` and click-through when the cursor isn't over it
+- **Priority layout**: history on top, final caption above the live draft; compact windows hide history first
+- **Stable drafts**: a new translation revision replaces the previous readable draft only after completion
+- **Natural wrapping**: final and draft captions wrap to the current window width without shrinking the font
 - **Bilingual subtitle**: switch source-on-top / translation-on-top live
 - **7 accent themes**: White / Ice / Gold / Neon / Coral / Violet / Cyan
 - **Liquid Glass**: SwiftUI `GlassEffectContainer` on macOS 26, `ultraThinMaterial` frosted fallback on macOS 15
@@ -227,7 +246,7 @@ Third-party components (see [NOTICE](NOTICE)):
 <!-- CONTRIBUTING -->
 ## Top contributors
 
-[![Contributors](https://ghcontrib.pages.dev/image?repo=nbzz%2Fwhicc)](https://github.com/nbzz/whicc/graphs/contributors)
+[![Contributors](https://ghcontrib.pages.dev/image?repo=checkkaka%2Fwhicc)](https://github.com/checkkaka/whicc/graphs/contributors)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
