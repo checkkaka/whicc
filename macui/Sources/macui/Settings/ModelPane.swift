@@ -132,28 +132,27 @@ struct ModelPane: View {
                     isCurrentReady: isFullyDownloaded(modelState.nonChineseASR),
                     onDownload: { downloadState.requestDownload(modelId: $0) }
                 )
-            }
 
-            SettingsCard {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Nemotron 实时延迟")
-                        .font(.system(size: 12, weight: .semibold))
-                    Picker("右上下文", selection: Binding(
-                        get: { langConfig.nemotronRightContext },
-                        set: {
-                            langConfig.setNemotronRightContext($0)
-                            Self.restartASRBackend()
+                if Self.usesNemotron(nonChineseASR: modelState.nonChineseASR) {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Nemotron 实时延迟")
+                            .font(.system(size: 12, weight: .semibold))
+                        Picker("右上下文", selection: Binding(
+                            get: { langConfig.nemotronRightContext },
+                            set: {
+                                langConfig.setNemotronRightContext($0)
+                                Self.restartASRBackend()
+                            }
+                        )) {
+                            Text("320ms · [56,3]（默认）").tag(3)
+                            Text("560ms · [56,6]").tag(6)
+                            Text("1.12s · [56,13]（质量）").tag(13)
                         }
-                    )) {
-                        Text("320ms · [56,3]").tag(3)
-                        Text("560ms · [56,6]（默认）").tag(6)
-                        Text("1.12s · [56,13]（质量）").tag(13)
+                        Text("三档英语 Auto WER 近似持平；中日文质量需以同批音频 A/B 为准。修改后自动重启识别后端。")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
-                    .disabled(!Self.usesNemotron(
-                        nonChineseASR: modelState.nonChineseASR))
-                    Text("三档英语 Auto WER 近似持平；中日文质量需以同批音频 A/B 为准。修改后自动重启识别后端。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
             }
 
@@ -285,8 +284,8 @@ struct ModelPane: View {
 
     static func usesNemotron(nonChineseASR: String) -> Bool {
         let effective = nonChineseASR.trimmingCharacters(in: .whitespacesAndNewlines)
-        let model = effective.isEmpty ? recommendedNonChineseASR : effective
-        return model.lowercased().contains("nemotron")
+        guard !effective.isEmpty else { return false }
+        return effective.lowercased().contains("nemotron")
     }
 
     /// 槽位选择器：下拉框只有 2 个选项 ——

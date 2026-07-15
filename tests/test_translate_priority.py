@@ -229,6 +229,7 @@ def test_length_truncated_partial_is_visible_but_never_reused():
     partials = [json.loads(line) for line in w.f_trans.getvalue().splitlines()
                 if json.loads(line)["event_type"] == "translation_partial"]
     assert partials[-1]["translated_full_text"] == "译文"
+    assert partials[-1]["partial_complete"] is True
     out = w._do_final(event(), "hello", "k")
     assert out["final_reused_partial"] is False
     assert translator.final.translate_calls == 1
@@ -267,6 +268,32 @@ def test_short_stream_emits_one_complete_cumulative_draft(monkeypatch):
                 if json.loads(line)["event_type"] == "translation_partial"]
     drafts = [item["translated_full_text"] for item in partials]
     assert drafts == ["实时翻译草稿"]
+    assert partials[0]["partial_complete"] is True
+
+
+def test_streaming_tokens_need_eight_chars_and_completion_marks_snapshot(
+        monkeypatch):
+    clock = [0]
+
+    class IncrementalTranslator(FakeTranslator):
+        def translate_streaming(self, source, on_token, target_lang,
+                                should_cancel=None):
+            full = ""
+            for piece in "一二三四五六七八九":
+                full += piece
+                clock[0] += 100_000_000
+                on_token(piece, full)
+            return full, 900.0
+
+    monkeypatch.setattr(ts.time, "monotonic_ns", lambda: clock[0])
+    w = worker(IncrementalTranslator())
+    w._do_partial(event(), "hello", "k")
+
+    partials = [json.loads(line) for line in w.f_trans.getvalue().splitlines()
+                if json.loads(line)["event_type"] == "translation_partial"]
+    assert [(item["translated_full_text"], item["partial_complete"])
+            for item in partials] == [("一二三四五六七八", False),
+                                      ("一二三四五六七八九", True)]
 
 
 def test_visible_partial_cadence_is_shared_across_revisions(monkeypatch):
@@ -297,7 +324,9 @@ def test_visible_partial_cadence_is_shared_across_revisions(monkeypatch):
     assert out["final_reused_partial"] is True
 
 
-def test_newer_partial_cancels_active_revision_before_it_can_flash():
+def test_newer_partial_allows_active_revision_to_finish_without_cancel(
+        monkeypatch):
+    monkeypatch.setattr(ts, "PARTIAL_VISIBLE_INTERVAL_NS", 0)
     translator = FakeTranslator(block_partial=True)
     w = worker(translator)
     w.start()
@@ -314,18 +343,23 @@ def test_newer_partial_cancels_active_revision_before_it_can_flash():
                 json.loads(line) for line in w.f_trans.getvalue().splitlines()
                 if json.loads(line)["event_type"] == "translation_partial"
             ]
-            if partials:
+            if len(partials) >= 2:
                 break
             time.sleep(.01)
     finally:
         w.stop()
 
-    assert [(item["revision"], item["source_text"]) for item in partials] == [
-        (2, "hello world")
+    assert [(item["revision"], item["source_text"], item["partial_complete"])
+            for item in partials] == [
+        (1, "hello", True),
+        (2, "hello world", True),
     ]
+    assert w.partial_cache["k"]["revision"] == 2
 
 
-def test_new_revision_marks_inflight_sse_stale_without_transport_cancel():
+def test_new_revision_suppresses_old_tokens_but_keeps_complete_snapshot(
+        monkeypatch):
+    monkeypatch.setattr(ts, "PARTIAL_VISIBLE_INTERVAL_NS", 0)
     class SlowTranslator(FakeTranslator):
         def __init__(self):
             super().__init__()
@@ -366,8 +400,10 @@ def test_new_revision_marks_inflight_sse_stale_without_transport_cancel():
     assert translator.completed == ["hello", "hello world"]
     partials = [json.loads(line) for line in w.f_trans.getvalue().splitlines()
                 if json.loads(line)["event_type"] == "translation_partial"]
-    assert {(item["revision"], item["source_text"]) for item in partials} == {
-        (2, "hello world")
+    assert {(item["revision"], item["source_text"], item["partial_complete"])
+            for item in partials} == {
+        (1, "hello", True),
+        (2, "hello world", True),
     }
 
 

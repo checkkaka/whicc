@@ -8,9 +8,9 @@ enum Palette {
     // minHeight 68 = 1 行 committed 字幕 + 一行高度。
     //   HUD 和 draft 在此高度自动隐藏,窗口拉高时回来。
     static let minWindowHeight: CGFloat = 68
-    // defaultHeight 100 = HUD (~70pt) + 一行 committed (~30pt)。
-    //   用户仍能拖到 minWindowHeight。
-    static let defaultWindowHeight: CGFloat = 100
+    // defaultHeight 240 = HUD + 上方稳定字幕 + 下方实时草稿均可读。
+    //   用户仍能拖到 minWindowHeight，此时优先保留稳定字幕。
+    static let defaultWindowHeight: CGFloat = 240
 
     // Backwards-compat aliases used in a few spots.
     static let minWidth: CGFloat = minWindowWidth
@@ -30,12 +30,12 @@ enum Palette {
     static let controlHeight: CGFloat = 22
 
     // Stage
-    // 显示三层(history + committed + draft)的最小 contentH。
-    //   160pt → 窗体 ≥ 230pt 显示 history。
+    // 显示 history 的最小 contentH。SubtitleStageView 还会在有实时
+    // draft 时隐藏 history，确保 final + draft 优先可读。
     static let historyMinVisible: CGFloat = 160
     // 显示 draft 的最小 contentH(独立于 minWindowHeight)。
-    //   90pt → 默认窗体 100pt 不显示 draft;拖到窗体 ≥ 160pt 才出现。
-    static let draftMinVisible: CGFloat = 90
+    //   70pt → 只要 final 下方还有一两行空间，就显示实时草稿。
+    static let draftMinVisible: CGFloat = 70
     static let sourceMinVisible: CGFloat = 62
     static let historyMaxHeight: CGFloat = 1200
 

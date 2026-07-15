@@ -493,7 +493,7 @@ final class BackendLauncher {
             modified = true
         }
         if json["nemotron_right_context"] == nil {
-            json["nemotron_right_context"] = 6
+            json["nemotron_right_context"] = 3
             modified = true
         }
         if json["translation_priority_enabled"] == nil {
@@ -505,7 +505,7 @@ final class BackendLauncher {
             modified = true
         }
         if json["nemotron_native_streaming_enabled"] == nil {
-            json["nemotron_native_streaming_enabled"] = false
+            json["nemotron_native_streaming_enabled"] = true
             modified = true
         }
 

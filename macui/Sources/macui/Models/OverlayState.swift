@@ -169,10 +169,13 @@ final class OverlayState: ObservableObject {
     @Published var draftSourceText: String?
     @Published var draftTranslatedText: String?
     @Published var draftStablePrefixLen: Int = 0
-    /// 当前草稿所属句子及版本；final/partial 独立 worker 可能乱序到达，
-    /// 旧句 final 和同句旧 revision 都不能覆盖已经显示的新草稿。
+    /// ASR 原文、已显示译文和候选译文分别推进版本。两个 JSONL watcher
+    /// 可能乱序到达，因此翻译 revision 不能反向覆盖更新的 ASR 原文。
     private var draftSourceKey: String?
-    private var draftSourceRevision: Int?
+    private var latestSourceRevision: Int?
+    private var displayedTranslationRevision: Int?
+    private var candidateTranslationRevision: Int?
+    private var candidateTranslationText: String?
 
     /// History (most-recent last), capped at 80.
     @Published var history: [OverlayCaption] = []
@@ -379,23 +382,11 @@ final class OverlayState: ObservableObject {
         case "translation_final", "translation_reset":
             applyFinal(event)
         case "translation_partial":
-            // 两个 JSONL watcher 可乱序：下一句 ASR 草稿已经显示时，
-            // 上一句慢翻译不能倒灌；若同一 run 的更高 sequence 翻译先于
-            // ASR watcher 到达，则允许它推进到新句。
-            guard canApplyTranslationDraft(event) else { break }
-            // 后端已对跨 revision 整段改写统一限流；这里跳过旧 delta 合并，
-            // 直接替换并由 source_key/revision 门禁阻止字幕倒退。
-            if event.isStreamingToken == true,
-               let full = event.translatedFullText {
-                if let source = event.sourceText, !source.isEmpty {
-                    draftSourceText = Self.deduplicateRepeated(source)
-                }
-                draftTranslatedText = full
-                updateDraftIdentity(from: event)
-            } else {
-                applyPartial(event)
+            // 新 revision 的零碎 token 先在候选槽累计，完整结束后再原子替换
+            // 上一版可读译文；首版没有可保留内容时，累计到 8 字即可显示。
+            if applyTranslationPartial(event) {
+                logUIMetric(event, appliedKind: "translation_draft")
             }
-            logUIMetric(event, appliedKind: "translation_draft")
         case "translation_error":
             totalErrors += 1
 
@@ -473,8 +464,10 @@ final class OverlayState: ObservableObject {
 
     private func applySourceDraft(_ event: TranslationEvent, logMetric: Bool) {
         guard let text = event.text, !text.isEmpty else { return }
-        if event.sourceKey == draftSourceKey, let currentRevision = draftSourceRevision {
-            guard let revision = event.revision, revision >= currentRevision else { return }
+        if event.sourceKey == draftSourceKey {
+            if let currentRevision = latestSourceRevision {
+                guard let revision = event.revision, revision >= currentRevision else { return }
+            }
         } else {
             clearDraft()
             pendingDraftSrc = nil
@@ -482,9 +475,10 @@ final class OverlayState: ObservableObject {
             pendingDraftKey = nil
             pendingDraftTs = 0
         }
+        draftSourceKey = event.sourceKey
+        latestSourceRevision = event.revision
         draftSourceText = Self.deduplicateRepeated(text)
         draftStablePrefixLen = 0
-        updateDraftIdentity(from: event)
         if logMetric { logUIMetric(event, appliedKind: "source_draft") }
     }
 
@@ -495,9 +489,7 @@ final class OverlayState: ObservableObject {
         guard let current = draftSourceKey,
               let incoming = event.sourceKey else { return true }
         if incoming == current {
-            guard let currentRevision = draftSourceRevision else { return true }
-            guard let incomingRevision = event.revision else { return false }
-            return incomingRevision >= currentRevision
+            return true
         }
         guard let currentParts = Self.sourceKeyParts(current),
               let incomingParts = Self.sourceKeyParts(incoming),
@@ -511,19 +503,65 @@ final class OverlayState: ObservableObject {
         return (String(key[..<colon]), sequence)
     }
 
-    private func updateDraftIdentity(from event: TranslationEvent) {
-        guard let key = event.sourceKey else { return }
-        if key != draftSourceKey {
-            draftSourceRevision = event.revision
-        } else if let revision = event.revision {
-            draftSourceRevision = revision
-        }
-        draftSourceKey = key
-    }
-
-    private func applyPartial(_ event: TranslationEvent) {
+    /// 应用一次完整源文的累计翻译。返回 true 仅表示 UI 的可见译文已更新。
+    private func applyTranslationPartial(_ event: TranslationEvent) -> Bool {
+        guard canApplyTranslationDraft(event) else { return false }
         let src = event.sourceText ?? event.deltaSourceText ?? ""
-        let trans = event.translatedDeltaText ?? event.translatedFullText
+        guard let raw = event.translatedFullText ?? event.translatedDeltaText,
+              !raw.isEmpty else { return false }
+        let trans = Self.deduplicateRepeated(raw)
+
+        if event.sourceKey != draftSourceKey {
+            clearDraft()
+            pendingDraftSrc = nil
+            pendingDraftTrans = nil
+            pendingDraftKey = nil
+            pendingDraftTs = 0
+            draftSourceKey = event.sourceKey
+        }
+        // 翻译 watcher 只在当前句还没有原文时补位；已有原文始终由 ASR
+        // watcher 更新，旧翻译完成也不会把它改回旧 revision。
+        if draftSourceText == nil, !src.isEmpty {
+            draftSourceText = Self.deduplicateRepeated(src)
+        }
+
+        let revision = event.revision ?? 0
+        if let displayed = displayedTranslationRevision, revision < displayed {
+            return false
+        }
+        if let candidate = candidateTranslationRevision,
+           revision < candidate,
+           revision != displayedTranslationRevision {
+            return false
+        }
+
+        if displayedTranslationRevision == revision {
+            // SSE 全文应只增长；忽略迟到的短快照，避免同 revision 倒退。
+            if let current = draftTranslatedText, trans.count < current.count {
+                return false
+            }
+            draftTranslatedText = trans
+            if event.partialComplete == true {
+                candidateTranslationRevision = nil
+                candidateTranslationText = nil
+            }
+            rememberDisplayedDraft(source: src, translation: trans, event: event)
+            return true
+        }
+
+        if candidateTranslationRevision != revision {
+            candidateTranslationRevision = revision
+            candidateTranslationText = nil
+        }
+        if candidateTranslationText == nil
+            || trans.count >= (candidateTranslationText?.count ?? 0)
+            || event.partialComplete == true {
+            candidateTranslationText = trans
+        }
+
+        let shouldDisplay = event.partialComplete == true
+            || (draftTranslatedText == nil && trans.count >= 8)
+        guard shouldDisplay, let completed = candidateTranslationText else { return false }
 
         // Log only "complete" drafts that get replaced before becoming final.
         if let oldSrc = pendingDraftSrc, let oldTrans = pendingDraftTrans,
@@ -533,17 +571,21 @@ final class OverlayState: ObservableObject {
             logLostDraft(src: oldSrc, trans: oldTrans, reason: "complete_sentence_replaced")
         }
 
-        if !src.isEmpty { draftSourceText = Self.deduplicateRepeated(src) }
-        draftTranslatedText = trans.map { Self.deduplicateRepeated($0) }
-        draftStablePrefixLen = event.sharedPrefixLen ?? 0
-        updateDraftIdentity(from: event)
+        draftTranslatedText = completed
+        displayedTranslationRevision = revision
+        candidateTranslationRevision = nil
+        candidateTranslationText = nil
+        rememberDisplayedDraft(source: src, translation: completed, event: event)
+        return true
+    }
 
-        if let t = trans, !t.isEmpty {
-            pendingDraftSrc = src
-            pendingDraftTrans = t
-            pendingDraftKey = event.sourceKey
-            pendingDraftTs = Date().timeIntervalSince1970
-        }
+    private func rememberDisplayedDraft(source: String,
+                                        translation: String,
+                                        event: TranslationEvent) {
+        pendingDraftSrc = source
+        pendingDraftTrans = translation
+        pendingDraftKey = event.sourceKey
+        pendingDraftTs = Date().timeIntervalSince1970
     }
 
     private func applyFinal(_ event: TranslationEvent) {
@@ -568,10 +610,10 @@ final class OverlayState: ObservableObject {
             }
             committed = caption
         }
-        if draftSourceKey == nil || draftSourceKey == key {
+        if draftSourceKey == key {
             clearDraft()
         }
-        if pendingDraftKey == nil || pendingDraftKey == key {
+        if pendingDraftKey == key {
             pendingDraftSrc = nil
             pendingDraftTrans = nil
             pendingDraftKey = nil
@@ -655,7 +697,10 @@ final class OverlayState: ObservableObject {
         draftTranslatedText = nil
         draftStablePrefixLen = 0
         draftSourceKey = nil
-        draftSourceRevision = nil
+        latestSourceRevision = nil
+        displayedTranslationRevision = nil
+        candidateTranslationRevision = nil
+        candidateTranslationText = nil
     }
 
     // MARK: - Visibility controls

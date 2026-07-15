@@ -39,7 +39,7 @@ PARTIAL_DRAFT_INTERVAL_NS = 500_000_000
 # ASR 每约 560ms 改一次完整源文时，逐版重译会整段改写。每句首版立即
 # 显示，此后所有 revision 共用 1s 展示门限；cache/final 仍处理每一版。
 PARTIAL_VISIBLE_INTERVAL_NS = 1_000_000_000
-PARTIAL_DRAFT_MIN_CHARS = 4
+PARTIAL_DRAFT_MIN_CHARS = 8
 
 
 # ── 共享文件 I/O ─────────────────────────────────────────────────────────────
@@ -456,8 +456,8 @@ class TranslateWorker:
         self._stopping = False
         self._active_partial_key: str | None = None
         self._active_partial_revision = 0
-        # transport cancel 只允许 final/stop 触发；新 partial revision 仅把
-        # 旧结果标 stale，不能掐断通常需 380–542ms 的在途 SSE。
+        # transport cancel 只允许 final/stop 触发；新 partial revision 仅
+        # 抑制旧请求的中间 token，不能掐断通常需 380–542ms 的在途 SSE。
         self._active_partial_transport_cancelled = False
         self._final_revision_by_key: dict[str, int] = {}
         self._last_visible_partial_ns_by_key: dict[str, int] = {}
@@ -484,7 +484,7 @@ class TranslateWorker:
         self._final_thread.join()
 
     def dispatch_partial(self, event, source_text, key):
-        """同 key 单槽 latest-only；新 revision 仅废弃旧结果，不断 SSE。"""
+        """同 key 单槽 latest-only；新 revision 不打断在途请求。"""
         event = dict(event)
         event["translation_enqueue_mono_ns"] = time.monotonic_ns()
         revision = int(event.get("revision", 0) or 0)
@@ -495,10 +495,10 @@ class TranslateWorker:
             if old is None or revision >= int(old[0].get("revision", 0) or 0):
                 self._partial_pending[key] = (event, source_text, key)
                 self._partial_cv.notify()
-        # 新 revision 只把旧结果标 stale，让在途请求自然结束后马上处理
-        # 单槽中的 latest。若每 320/560ms 都 close SSE，而翻译常需
-        # 380–542ms，连续讲话时可能永远产不出首个草稿。真正的连接抢占
-        # 只留给 final。
+        # 新 revision 抑制旧请求的中间 token，但允许它产出完整快照和
+        # 严格复用 cache，再处理单槽中的 latest。若每 320/560ms 都
+        # close SSE，而翻译常需 380–542ms，连续讲话时可能永远产不出
+        # 首个草稿。真正的连接抢占只留给 final/stop。
 
     def dispatch_final(self, event, source_text, key):
         """final 立即进入独立 FIFO，并取消同 key 的 partial。"""
@@ -581,7 +581,7 @@ class TranslateWorker:
                       flush=True)
 
     def _do_partial(self, event, source_text, key):
-        """始终用当前完整源文流式翻译；结果只能更新 draft。"""
+        """始终用当前完整源文流式翻译；中间稿和完整快照都只更新 draft。"""
         revision = int(event.get("revision", 0) or 0)
         with self._cache_lock:
             cached = self.partial_cache.get(key)
@@ -601,12 +601,13 @@ class TranslateWorker:
                 pending
                 and int(pending[0].get("revision", 0) or 0) > revision)
 
-        def is_stale() -> bool:
-            """新 revision 只禁止旧草稿上屏/缓存，不关闭 HTTP 连接。"""
+        def is_terminal_stale() -> bool:
+            """只有 final/stop 会让本次结果彻底失效。"""
             with self._partial_cv:
                 return (
-                    self._final_revision_by_key.get(key, -1) >= revision
-                    or has_newer_pending_locked()
+                    self._stopping
+                    or self._active_partial_transport_cancelled
+                    or self._final_revision_by_key.get(key, -1) >= revision
                 )
 
         def should_cancel_transport() -> bool:
@@ -620,7 +621,9 @@ class TranslateWorker:
                         and self._active_partial_transport_cancelled)
                 )
 
-        def emit_partial(piece: str, cleaned: str, now_ns: int) -> bool:
+        def emit_partial(piece: str, cleaned: str, now_ns: int, *,
+                         partial_complete: bool = False,
+                         bypass_cadence: bool = False) -> bool:
             actual_request_start_ns = (
                 getattr(self.translator, "request_start_mono_ns", 0)
                 or request_start_ns)
@@ -630,6 +633,7 @@ class TranslateWorker:
                 "revision": revision,
                 "source_text": source_text,
                 "translated_full_text": cleaned,
+                "partial_complete": partial_complete,
                 "is_streaming_token": True,
                 "streaming_piece": piece,
                 "translation_enqueue_mono_ns": event.get("translation_enqueue_mono_ns", 0),
@@ -643,10 +647,12 @@ class TranslateWorker:
             # 要么在 final 已登记后被拒绝，绝不会在 final 后复活。
             with self._partial_cv:
                 if (self._final_revision_by_key.get(key, -1) >= revision
-                        or has_newer_pending_locked()):
+                        or self._stopping
+                        or self._active_partial_transport_cancelled
+                        or (not partial_complete and has_newer_pending_locked())):
                     return False
                 last_visible_ns = self._last_visible_partial_ns_by_key.get(key)
-                if (last_visible_ns is not None
+                if (not bypass_cadence and last_visible_ns is not None
                         and now_ns - last_visible_ns
                         < PARTIAL_VISIBLE_INTERVAL_NS):
                     return False
@@ -658,8 +664,11 @@ class TranslateWorker:
 
         def on_token(piece: str, full: str) -> None:
             nonlocal first_token_ns, last_draft_emit_ns, last_draft_text
-            if is_stale():
+            if is_terminal_stale():
                 return
+            with self._partial_cv:
+                if has_newer_pending_locked():
+                    return
             now_ns = time.monotonic_ns()
             if not first_token_ns:
                 first_token_ns = now_ns
@@ -676,7 +685,7 @@ class TranslateWorker:
                 return
             # 单次 SSE 只发送累计全文；跨 revision 的整段改写还会在
             # emit_partial() 里按 source_key 统一限为最多约 1 次/秒。
-            if is_stale():
+            if is_terminal_stale():
                 return
             if emit_partial(piece, cleaned, now_ns):
                 last_draft_emit_ns = now_ns
@@ -684,7 +693,7 @@ class TranslateWorker:
 
         try:
             _log_glossary_hits(self.translator, source_text, target_lang)
-            if is_stale():
+            if is_terminal_stale():
                 return
             translated, ms = self.translator.translate_streaming(
                 source_text, on_token=on_token, target_lang=target_lang,
@@ -696,7 +705,7 @@ class TranslateWorker:
             print(f"\n[partial] 全量流式翻译已取消或失败: {exc}", flush=True)
             return
 
-        if is_stale():
+        if is_terminal_stale():
             return
 
         translated, leak_hit = _strip_prompt_leak(translated)
@@ -707,9 +716,13 @@ class TranslateWorker:
         reuse_valid = (draft_valid
                        and _finish_reason_allows_reuse(finish_reason))
         completed_ns = time.monotonic_ns()
-        # 流结束时补最后一版，确保节流窗口中的尾部 token 不丢。
-        if draft_valid and translated != last_draft_text:
-            emit_partial("", translated, completed_ns)
+        # 流结束时发送完整快照。若本 revision 已显示过中间稿，只更新
+        # complete 标记/尾部文本，不受跨 revision 的 1s 可见节流影响；
+        # 完整短输出也不受中间稿 8 字门限限制。
+        if draft_valid:
+            emit_partial(
+                "", translated, completed_ns, partial_complete=True,
+                bypass_cadence=bool(last_draft_text))
         snapshot = {
             "source_text": source_text,
             "translated_text": translated,

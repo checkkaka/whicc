@@ -31,6 +31,8 @@ struct TranslationEvent: Decodable, Equatable, Sendable {
     // source_key 的跨 revision 展示统一限为最多约 1 次/秒。历史事件仍兼容。
     let isStreamingToken: Bool?
     let streamingPiece: String?
+    /// 当前 revision 的流式翻译已经完整结束；缺失时按未完成处理，兼容旧日志。
+    let partialComplete: Bool?
 
     enum CodingKeys: String, CodingKey {
         case eventType = "event_type"
@@ -56,6 +58,7 @@ struct TranslationEvent: Decodable, Equatable, Sendable {
         case statusColor = "status_color"
         case isStreamingToken = "is_streaming_token"
         case streamingPiece = "streaming_piece"
+        case partialComplete = "partial_complete"
     }
 }
 

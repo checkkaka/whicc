@@ -1,0 +1,13 @@
+{
+  "source_s16le": "/Users/bang/dev/ios/whicc/test_audio/live_capture_20260715-121926.s16le",
+  "pcm_f32le": "/Users/bang/dev/ios/whicc/test_audio/live_capture_20260715-121926.f32le.pcm",
+  "sample_rate": 16000,
+  "channels": 1,
+  "format": "float32le",
+  "original_duration_sec": 112.1,
+  "trim_start_sec": 4.4,
+  "trim_end_sec": 106.54,
+  "duration_sec": 102.14,
+  "max_abs_s16": 27938,
+  "created_at": "2026-07-15T04:22:02Z"
+}

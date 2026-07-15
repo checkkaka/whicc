@@ -337,16 +337,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openSettings()
     }
 
-    /// ⌘W handler — close the key window.
-    /// Subtitle panel → terminate app (same as ⌘Q / red button).
-    /// Settings window → close just the window.
+    /// ⌘W handler — close/hide the key window.
+    /// Subtitle panel follows normal macOS window behavior: hide the
+    /// overlay, keep ASR/translation running. Cmd+Q is the explicit app
+    /// quit path that tears down the backend.
     @MainActor
     @objc func closeWindowFromMenu() {
         if let panel = windowController?.panel, panel.isKeyWindow {
-            NSApp.terminate(nil)
+            panel.close()
         } else if let win = settingsWindow, win.isKeyWindow {
             win.close()
         }
+    }
+
+    @MainActor
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        if !flag, let panel = windowController?.panel {
+            panel.makeKeyAndOrderFront(nil)
+            return true
+        }
+        return true
     }
 
     @MainActor

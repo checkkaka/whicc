@@ -15,7 +15,7 @@ final class OverlayStateTests: XCTestCase {
         state.apply(try event("""
             {"event_type":"translation_partial","source_key":"next","revision":1,
              "source_text":"Next sentence","translated_full_text":"下一句",
-             "is_streaming_token":true}
+             "is_streaming_token":true,"partial_complete":true}
             """))
 
         state.apply(try event("""
@@ -105,8 +105,88 @@ final class OverlayStateTests: XCTestCase {
         XCTAssertNil(state.draftTranslatedText)
     }
 
-    func testEmptyNonChineseSlotUsesDefaultNemotronSettings() {
-        XCTAssertTrue(ModelPane.usesNemotron(nonChineseASR: ""))
+    func testTranslationEventDecodesOptionalPartialComplete() throws {
+        XCTAssertTrue(try event("""
+            {"event_type":"translation_partial","partial_complete":true}
+            """).partialComplete == true)
+        XCTAssertNil(try event("""
+            {"event_type":"translation_partial"}
+            """).partialComplete)
+    }
+
+    func testNewSourceRevisionKeepsTranslationAndTranslationNeverRevertsSource() throws {
+        let state = OverlayState()
+        state.applyTranscription(try event("""
+            {"event_type":"partial","source_key":"same","revision":1,"text":"First source"}
+            """))
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":1,
+             "source_text":"First source","translated_full_text":"第一版译文",
+             "partial_complete":true}
+            """))
+
+        state.applyTranscription(try event("""
+            {"event_type":"partial","source_key":"same","revision":2,"text":"Newest source"}
+            """))
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":1,
+             "source_text":"First source","translated_full_text":"第一版译文已经完成",
+             "partial_complete":true}
+            """))
+
+        XCTAssertEqual(state.draftSourceText, "Newest source")
+        XCTAssertEqual(state.draftTranslatedText, "第一版译文已经完成")
+    }
+
+    func testNewTranslationRevisionWaitsUntilCompleteBeforeAtomicReplacement() throws {
+        let state = OverlayState()
+        state.applyTranscription(try event("""
+            {"event_type":"partial","source_key":"same","revision":1,"text":"Source"}
+            """))
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":1,
+             "translated_full_text":"旧版完整译文","partial_complete":true}
+            """))
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":2,
+             "translated_full_text":"新"}
+            """))
+        XCTAssertEqual(state.draftTranslatedText, "旧版完整译文")
+
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":2,
+             "translated_full_text":"新版","partial_complete":true}
+            """))
+        XCTAssertEqual(state.draftTranslatedText, "新版")
+    }
+
+    func testFirstTranslationWaitsForEightCharactersButCompleteShortSentenceDisplays() throws {
+        let state = OverlayState()
+        state.applyTranscription(try event("""
+            {"event_type":"partial","source_key":"same","revision":1,"text":"Source"}
+            """))
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":1,
+             "translated_full_text":"1234567"}
+            """))
+        XCTAssertNil(state.draftTranslatedText)
+
+        state.apply(try event("""
+            {"event_type":"translation_partial","source_key":"same","revision":1,
+             "translated_full_text":"12345678"}
+            """))
+        XCTAssertEqual(state.draftTranslatedText, "12345678")
+
+        let shortState = OverlayState()
+        shortState.apply(try event("""
+            {"event_type":"translation_partial","source_key":"short","revision":1,
+             "translated_full_text":"好。","partial_complete":true}
+            """))
+        XCTAssertEqual(shortState.draftTranslatedText, "好。")
+    }
+
+    func testNemotronSettingsOnlyShowForExplicitNemotronSlot() {
+        XCTAssertFalse(ModelPane.usesNemotron(nonChineseASR: ""))
         XCTAssertTrue(ModelPane.usesNemotron(
             nonChineseASR: "mlx-community/nemotron-3.5-asr-streaming-0.6b"))
         XCTAssertFalse(ModelPane.usesNemotron(

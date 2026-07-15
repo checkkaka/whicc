@@ -132,7 +132,7 @@ struct SubtitleText: View {
             .foregroundColor(color)
             .multilineTextAlignment(.center)
             .lineLimit(lineLimit)
-            .minimumScaleFactor(0.82)
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity)
             .textSelection(.enabled)
             .shadow(color: .black.opacity(shadowStrong),

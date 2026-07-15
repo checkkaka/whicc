@@ -451,6 +451,17 @@ def test_native_max_split_moves_back_to_complete_word_boundary():
         segments, target_sec=10.0, max_lookback_sec=1.5) == pytest.approx(9.4)
     assert whicc.find_native_word_split_sec(
         segments, target_sec=10.0, max_lookback_sec=.7) == pytest.approx(9.4)
+    split_sec, force_quality = whicc.resolve_native_max_split(
+        segments, target_sec=10.0, max_lookback_sec=1.5)
+    assert split_sec == pytest.approx(9.4)
+    assert force_quality is False
+
+
+def test_native_max_split_without_word_boundary_forces_quality_batch():
+    assert whicc.resolve_native_max_split(
+        [{"text": "firmly", "start": 9.85, "end": 10.05}],
+        target_sec=10.0,
+    ) == (10.0, True)
 
 
 def test_speech_bounds_use_20ms_frames():
@@ -613,6 +624,14 @@ def test_punct_end_requires_same_text_from_two_probes():
         "Question?", "Question? Next thought"
     ) == ("Question?", True)
 
+    # !? 及中日韩句末符号没有缩写/小数歧义，首次可靠观察即可提交。
+    assert whicc.update_punct_end_stability(
+        None, "Question?"
+    ) == ("Question?", True)
+    assert whicc.update_punct_end_stability(
+        None, "完成了。"
+    ) == ("完成了。", True)
+
     assert whicc.update_punct_end_stability(candidate, "No punctuation") == (None, False)
 
 
@@ -656,11 +675,11 @@ def test_ascii_period_prefix_is_not_a_stable_sentence_boundary(first, extended):
     assert whicc.update_punct_end_stability(first, extended) == (None, False)
 
 
-def test_stable_ascii_period_still_requires_real_pause_before_submit():
+def test_stable_ascii_period_does_not_add_a_second_pause_wait():
     candidate, stable = whicc.update_punct_end_stability(None, "I met Dr.")
     candidate, stable = whicc.update_punct_end_stability(candidate, "I met Dr.")
     assert stable is True
-    assert whicc.punctuation_pause_ready(candidate, 0.1) is False
+    assert whicc.punctuation_pause_ready(candidate, 0.0) is True
     assert whicc.punctuation_pause_ready(candidate, whicc.PUNCT_SUBMIT_SEC) is True
     assert whicc.punctuation_pause_ready("Question?", 0.0) is True
 
@@ -728,11 +747,17 @@ def test_stale_probe_snapshot_preserves_all_later_pcm_as_next_remainder():
 
 def test_right_context_config_and_cli_priority(tmp_path):
     path = tmp_path / "lang_config.json"
+    assert whicc.load_latency_config(str(path)) == {
+        "nemotron_right_context": 3,
+        "translation_priority_enabled": True,
+        "probe_partial_enabled": True,
+        "nemotron_native_streaming_enabled": True,
+    }
     path.write_text(json.dumps({"nemotron_right_context": 3}), encoding="utf-8")
     assert whicc.load_latency_config(str(path))["nemotron_right_context"] == 3
     assert whicc.load_latency_config(str(path), 13)["nemotron_right_context"] == 13
     path.write_text(json.dumps({"nemotron_right_context": 99}), encoding="utf-8")
-    assert whicc.load_latency_config(str(path))["nemotron_right_context"] == 6
+    assert whicc.load_latency_config(str(path))["nemotron_right_context"] == 3
 
 
 def test_nemotron_chunk_mapping_and_commit_preserves_remainder():

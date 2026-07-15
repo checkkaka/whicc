@@ -94,7 +94,8 @@ def _is_model_complete(local_path: str) -> bool:
     return any(n.endswith((".safetensors", ".npz")) for n in names)
 
 # 自适应 chunk (对齐 livecaption 策略,2026-06-28)
-#   min=2.0, soft_max=5.0, max=10.0 (兜底), punct=0.6s, silence=1.2s
+#   min=2.0, soft_max=5.0, max=10.0 (硬上限), silence=1.2s
+#   稳定句末标点直接提交；0.6s 仅保留给已提交标点句后的静音路径。
 #   核心改进: SILENCE_SUBMIT_SEC 0.4→1.2 — 思考停顿不再被当句尾
 #   SOFT_MAX_SEC=5.0 — 长演讲累积够立刻在标点切,不强制切半
 # 字幕触发参数 (平衡"快速显示" vs "完整句不切碎"):
@@ -102,7 +103,7 @@ def _is_model_complete(local_path: str) -> bool:
 #   (中文 ASR streaming 容易幻觉句末标点,需要更多上下文才稳)。
 # - SOFT_MAX_SEC = 5.0: 累积 5s 还没切 → 强制在中间标点切,防止字幕延迟
 #   触发阈值的语言分层:
-#   - 英文场景: 3s 后检查；句末跨两次观察确认，`.` 另需 0.6s 静音防缩写/小数误切
+#   - 英文场景: 3s 后检查；`.` 跨两次观察防缩写/小数，其他强标点首次确认
 #   - 中文场景: ASR 容易"幻觉"句末标点 (3s 仅 10-15 字时频繁误判),需要更长阈值
 #   PUNCT_END_MIN_CHUNK_SEC_EN / _ZH 在 probe ASR 拿到 language 后动态选。
 PUNCT_END_MIN_CHUNK_SEC_EN = 3.0   # 英文 (Nemotron 在英文 streaming 上 3s 标点可靠)
@@ -154,7 +155,7 @@ def is_valid_partial_text(text: str) -> bool:
 
 def update_punct_end_stability(candidate: str | None,
                                text: str | None) -> tuple[str | None, bool]:
-    """句末标点至少跨两次观察稳定，避免把缩写/小数点误当句末。"""
+    """ASCII 句点跨两次观察确认；无歧义强标点首次即可确认。"""
     stripped = (text or "").strip()
     if candidate:
         if stripped == candidate:
@@ -165,7 +166,7 @@ def update_punct_end_stability(candidate: str | None,
             return candidate, True
     if not stripped or stripped[-1:] not in STRONG_END_PUNCT:
         return None, False
-    return stripped, False
+    return stripped, stripped[-1:] != "."
 
 
 def update_native_punct_stability(candidate: str | None, stable: bool,
@@ -181,10 +182,9 @@ def update_native_punct_stability(candidate: str | None, stable: bool,
 
 def punctuation_pause_ready(candidate: str | None,
                             silence_streak: float) -> bool:
-    """ASCII 句点可能是缩写/小数，必须伴随真实停顿才允许提交。"""
-    return bool(candidate) and (
-        candidate.rstrip()[-1:] != "."
-        or silence_streak >= PUNCT_SUBMIT_SEC)
+    """候选已完成标点稳定性确认，不再叠加第二段静音等待。"""
+    _ = silence_streak  # 保留参数，避免主循环和历史测试调用面分叉。
+    return bool(candidate)
 
 
 def native_guarded_max_split_sec(chunk_sec: float, max_chunk_sec: float,
@@ -207,6 +207,20 @@ def find_native_word_split_sec(segments, *, target_sec: float,
         if lower <= start <= target_sec and text[:1].isspace():
             candidate = start
     return candidate
+
+
+def resolve_native_max_split(segments, *, target_sec: float,
+                             max_lookback_sec: float = 1.5
+                             ) -> tuple[float, bool]:
+    """返回 native 硬上限切点及是否必须用 ``[56,13]`` 批处理。
+
+    有可靠空格起始 token 时回退到完整单词；否则仍在原 max_chunk
+    边界切开，并由调用方对前半段走质量档批处理，禁止继续无限累积。
+    """
+    word_split = find_native_word_split_sec(
+        segments, target_sec=target_sec,
+        max_lookback_sec=max_lookback_sec)
+    return (word_split, False) if word_split else (target_sec, True)
 
 
 def sync_native_after_submit(
@@ -1042,16 +1056,16 @@ def load_latency_config(path: str, cli_right_context: int | None = None) -> dict
             raw = json.load(f)
     except (OSError, json.JSONDecodeError):
         raw = {}
-    configured = raw.get("nemotron_right_context", 6)
+    configured = raw.get("nemotron_right_context", 3)
     right_context = cli_right_context if cli_right_context is not None else configured
     if right_context not in (3, 6, 13):
-        right_context = 6
+        right_context = 3
     return {
         "nemotron_right_context": right_context,
         "translation_priority_enabled": bool(raw.get("translation_priority_enabled", True)),
         "probe_partial_enabled": bool(raw.get("probe_partial_enabled", True)),
         "nemotron_native_streaming_enabled": bool(
-            raw.get("nemotron_native_streaming_enabled", False)
+            raw.get("nemotron_native_streaming_enabled", True)
         ),
     }
 
@@ -1972,6 +1986,7 @@ def main():
                      overlap_applied: bool = False,
                      overlap_sample_count: int = 0,
                      precomputed_result: dict | None = None,
+                     force_quality_context: bool = False,
                      source_key: str = "", revision: int = 0,
                      speech_start_ns: int = 0, speech_end_ns: int = 0,
                      capture_end_mono_ns: int = 0) -> bool:
@@ -2030,7 +2045,8 @@ def main():
             else:
                 t_infer_start = time.monotonic()
                 asr_request_start_mono_ns = time.monotonic_ns()
-                right_context = (13 if native_stream_fallback_until_commit
+                right_context = (13 if (force_quality_context
+                                         or native_stream_fallback_until_commit)
                                  else args.nemotron_right_context)
                 try:
                     result = do_transcribe(
@@ -2621,8 +2637,8 @@ def main():
             seg_end = samples_ingested // SAMPLE_RATE  # 当前虚拟段号(累计秒)
 
             # ---- 探针 ASR: 累积够 MIN_CHUNK_SEC (2s) 就跑,持续刷新 sm_text ----
-            # 句末必须跨两次观察稳定；ASCII `.` 只接受完全相同的复现，
-            # 避免把 Dr. / 21.4 当句末，其他强句末符号可保留前缀确认。
+            # ASCII `.` 必须跨两次观察稳定，避免把 Dr. / 21.4 当句末；
+            # !? 及中日韩强句末符号首次可靠观察即可确认。
             # 软最大值切割在下面单独判断,共用 sm_text 缓存不重复跑推理。
             native_active = (native_stream is not None
                              and resolved_backend == "nemotron"
@@ -2833,15 +2849,20 @@ def main():
             guarded_max_split = native_guarded_max_split_sec(
                 chunk_sec, args.max_chunk_sec, native_lookahead_sec)
 
-            # ---- 软最大值断句: 累积够 SOFT_MAX_SEC (4.6s) 才在标点处切 ----
+            # ---- 软最大值 / native 硬上限断句 ----
             # 共用上面探针的 sm_text/sm_segments 缓存,不重复跑推理。
             # 找到合适的标点 → 在标点位置切 (前半提交 final, 后半作为新 chunk 继续)。
-            if chunk_sec >= SOFT_MAX_SEC and has_speech and sm_text:
-                split_sec = find_audio_split_sec(
+            # native 到 max_chunk + look-ahead 后即使没有文本/可靠 token
+            # 边界也必须切；前 max_chunk 秒改走 [56,13]，尾部 PCM 原样保留。
+            if (chunk_sec >= SOFT_MAX_SEC and has_speech
+                    and (sm_text or guarded_max_split)):
+                split_sec = (find_audio_split_sec(
                     sm_text, chunk_sec, sm_segments,
-                    min_char_pos=SOFT_MAX_MIN_CHARS)
+                    min_char_pos=SOFT_MAX_MIN_CHARS) if sm_text else 0)
                 split_label = "整句"
-                if split_sec == 0 and len(sm_text) >= SOFT_MAX_MIN_CHARS:
+                force_quality_batch = False
+                if (split_sec == 0 and sm_text
+                        and len(sm_text) >= SOFT_MAX_MIN_CHARS):
                     split_sec = find_audio_split_sec(
                         sm_text, chunk_sec, sm_segments,
                         punct_set=SENTENCE_END_PUNCT | MID_PUNCT,
@@ -2854,18 +2875,18 @@ def main():
                     or split_sec > chunk_sec - max_remainder)
                 if split_invalid and guarded_max_split:
                     # max_chunk 本身不变，只额外等当前档位的右上下文。这样
-                    # 迟到 token 与 SentencePiece 子词能整体留在正确一侧。
-                    word_split = find_native_word_split_sec(
+                    # 迟到 token 与 SentencePiece 子词能整体留在正确一侧；
+                    # 无可靠整词边界则仍在 max_chunk 切，并强制质量档批处理。
+                    split_sec, force_quality_batch = resolve_native_max_split(
                         sm_segments, target_sec=guarded_max_split,
                         max_lookback_sec=1.5)
-                    if word_split:
-                        split_sec = word_split
-                        split_label = "右上下文整词"
-                        min_split = 0.5
-                        max_remainder = 0.3
-                        split_invalid = (
-                            split_sec <= min_split
-                            or split_sec > chunk_sec - max_remainder)
+                    split_label = ("右上下文质量回退" if force_quality_batch
+                                   else "右上下文整词")
+                    min_split = 0.5
+                    max_remainder = 0.3
+                    split_invalid = (
+                        split_sec <= min_split
+                        or split_sec > chunk_sec - max_remainder)
                 if split_invalid:
                     if split_sec > 0:
                         print(f"[soft-max] 标点位置不佳 ({split_sec:.1f}s/{chunk_sec:.1f}s)，继续积累",
@@ -2876,24 +2897,28 @@ def main():
                     first_part = all_sm[:split_pos]
                     remainder_audio = all_sm[split_pos:]
                     is_full = split_label == "整句"
-                    reason = ("max_chunk" if split_label == "右上下文整词"
+                    reason = ("max_chunk" if split_label.startswith("右上下文")
                               else "soft_max" if is_full
                               else "soft_max_split")
                     print(f"[soft-max] {split_label}断句 @{split_sec:.1f}s: "
-                          f"{sm_text[:50]} | 剩余 {len(remainder_audio)/SAMPLE_RATE:.1f}s",
+                          f"{(sm_text or '')[:50]} | 剩余 "
+                          f"{len(remainder_audio)/SAMPLE_RATE:.1f}s",
                           file=sys.stderr, flush=True)
                     native_final = (native_final_snapshot(
                                         split_sec, finalize_stream=False)
-                                    if native_active else None)
+                                    if native_active and not force_quality_batch
+                                    else None)
                     native_active_for_sync = (
                         native_active
+                        and not force_quality_batch
                         and not native_stream_fallback_until_commit)
                     first_part_for_submit, split_overlap_count = (
                         prepare_split_submission_audio(
                             first_part, tail_overlap,
                             native_active=native_active_for_sync,
                             native_fallback=(
-                                native_stream_fallback_until_commit),
+                                native_stream_fallback_until_commit
+                                or force_quality_batch),
                         )
                     )
                     submitted = submit_chunk(
@@ -2907,6 +2932,7 @@ def main():
                         overlap_sample_count=split_overlap_count,
                         # 优先复用持久流状态；缺失可靠时间戳时批处理保底。
                         precomputed_result=native_final,
+                        force_quality_context=force_quality_batch,
                         capture_end_mono_ns=(
                             latest_capture_end_mono_ns
                             - int((chunk_sec - split_sec) * 1_000_000_000)
