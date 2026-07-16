@@ -103,7 +103,7 @@ def _is_model_complete(local_path: str) -> bool:
 #   (中文 ASR streaming 容易幻觉句末标点,需要更多上下文才稳)。
 # - SOFT_MAX_SEC = 5.0: 累积 5s 还没切 → 强制在中间标点切,防止字幕延迟
 #   触发阈值的语言分层:
-#   - 英文场景: 3s 后检查；`.` 跨两次观察防缩写/小数，其他强标点首次确认
+#   - 英文场景: 3s 后检查；所有强句末标点至少跨两次真实解码观察确认
 #   - 中文场景: ASR 容易"幻觉"句末标点 (3s 仅 10-15 字时频繁误判),需要更长阈值
 #   PUNCT_END_MIN_CHUNK_SEC_EN / _ZH 在 probe ASR 拿到 language 后动态选。
 PUNCT_END_MIN_CHUNK_SEC_EN = 3.0   # 英文 (Nemotron 在英文 streaming 上 3s 标点可靠)
@@ -155,18 +155,18 @@ def is_valid_partial_text(text: str) -> bool:
 
 def update_punct_end_stability(candidate: str | None,
                                text: str | None) -> tuple[str | None, bool]:
-    """ASCII 句点跨两次观察确认；无歧义强标点首次即可确认。"""
+    """句末标点跨两次观察确认，给 decoder 修正过早标点的机会。"""
     stripped = (text or "").strip()
     if candidate:
         if stripped == candidate:
             return candidate, True
         # `.` 也可能是 Dr. / 21.4；后续一旦扩展就作废旧候选。
-        # !? 及中日韩句末符号没有这种歧义，可在前缀保留时确认。
+        # 非句点标点若仍是完整前缀，说明边界已被下一轮解码保留。
         if candidate[-1:] != "." and stripped.startswith(candidate):
             return candidate, True
     if not stripped or stripped[-1:] not in STRONG_END_PUNCT:
         return None, False
-    return stripped, stripped[-1:] != "."
+    return stripped, False
 
 
 def update_native_punct_stability(candidate: str | None, stable: bool,
@@ -2637,8 +2637,8 @@ def main():
             seg_end = samples_ingested // SAMPLE_RATE  # 当前虚拟段号(累计秒)
 
             # ---- 探针 ASR: 累积够 MIN_CHUNK_SEC (2s) 就跑,持续刷新 sm_text ----
-            # ASCII `.` 必须跨两次观察稳定，避免把 Dr. / 21.4 当句末；
-            # !? 及中日韩强句末符号首次可靠观察即可确认。
+            # 所有强句末标点必须跨两次真实解码观察稳定：既避免 Dr. / 21.4，
+            # 也给 decoder 机会把过早的 `?` 后移，防止句尾词被拆成下一条。
             # 软最大值切割在下面单独判断,共用 sm_text 缓存不重复跑推理。
             native_active = (native_stream is not None
                              and resolved_backend == "nemotron"

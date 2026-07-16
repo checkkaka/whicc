@@ -624,13 +624,27 @@ def test_punct_end_requires_same_text_from_two_probes():
         "Question?", "Question? Next thought"
     ) == ("Question?", True)
 
-    # !? 及中日韩句末符号没有缩写/小数歧义，首次可靠观察即可提交。
+    # `?` 首次出现也不能立即提交：decoder 可能在下一轮把问号后移。
     assert whicc.update_punct_end_stability(
         None, "Question?"
-    ) == ("Question?", True)
+    ) == ("Question?", False)
     assert whicc.update_punct_end_stability(
         None, "完成了。"
-    ) == ("完成了。", True)
+    ) == ("完成了。", False)
+
+    candidate, stable = whicc.update_punct_end_stability(
+        None, "Could AI help people stop?"
+    )
+    assert stable is False
+    candidate, stable = whicc.update_punct_end_stability(
+        candidate, "Could AI help people stop feeling misunderstood?"
+    )
+    assert (candidate, stable) == (
+        "Could AI help people stop feeling misunderstood?", False
+    )
+    assert whicc.update_punct_end_stability(candidate, candidate) == (
+        candidate, True
+    )
 
     assert whicc.update_punct_end_stability(candidate, "No punctuation") == (None, False)
 
